@@ -1,7 +1,7 @@
 /// <reference lib="deno.ns" />
 
 const ROOT = new URL("../", import.meta.url);
-const METAINFO = new URL("../src-tauri/bundle/rustydeck.metainfo.xml", import.meta.url);
+const METAINFO = new URL("../src/bundle/rustydeck.metainfo.xml", import.meta.url);
 const STARTERPACK_MANIFEST = new URL("../plugins/com.amansprojects.starterpack.sdPlugin/assets/manifest.json", import.meta.url);
 
 function usage(): never {
@@ -18,7 +18,7 @@ async function run(cmd: string, args: string[], cwd = ROOT): Promise<string> {
 }
 
 async function bumpCrateVersion(version: string) {
-	const cwd = new URL(`../src-tauri/`, import.meta.url);
+	const cwd = new URL(`../src/`, import.meta.url);
 	const manifest = new URL("Cargo.toml", cwd);
 
 	const toml = await Deno.readTextFile(manifest);

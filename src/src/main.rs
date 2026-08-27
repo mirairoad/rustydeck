@@ -233,7 +233,7 @@ fn main() {
 							true
 						}
 					});
-					let shell = cx.new(|cx| ui::OpenDeckShell::new(window, cx));
+					let shell = cx.new(|cx| ui::RustyDeckShell::new(window, cx));
 					cx.new(|cx| Root::new(shell, window, cx))
 				},
 			)

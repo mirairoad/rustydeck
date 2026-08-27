@@ -108,7 +108,7 @@ impl ActionForm {
     }
 }
 
-pub struct OpenDeckShell {
+pub struct RustyDeckShell {
     device: Option<DeviceInfo>,
     profile: Option<Profile>,
     devices: Vec<DeviceInfo>,
@@ -122,7 +122,7 @@ pub struct OpenDeckShell {
     row_menu_open: Option<String>,
 }
 
-impl OpenDeckShell {
+impl RustyDeckShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
             refresh_catalogue(&this, cx).await;
@@ -581,7 +581,7 @@ async fn push_device_images(device: DeviceInfo, profile: Profile) {
 ///
 /// Cheaper to re-read than to replay the backend's relocation rules up here - contexts, child
 /// indices and image paths all shift on a move, and one source of truth is enough.
-async fn reload_profile(this: &WeakEntity<OpenDeckShell>, cx: &mut gpui::AsyncApp) {
+async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
     let Some(device) = this.update(cx, |this, _| this.device.clone()).ok().flatten() else {
         return;
     };
@@ -598,7 +598,7 @@ async fn reload_profile(this: &WeakEntity<OpenDeckShell>, cx: &mut gpui::AsyncAp
 }
 
 /// Refresh the device list and action palette, auto-selecting a device if none is chosen yet.
-async fn refresh_catalogue(this: &WeakEntity<OpenDeckShell>, cx: &mut gpui::AsyncApp) {
+async fn refresh_catalogue(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
     let devices: Vec<DeviceInfo> = crate::bridge(frontend::get_devices()).await.iter().map(|entry| entry.value().clone()).collect();
 
     let mut categories: Vec<(String, Category)> = crate::bridge(frontend::get_categories()).await.into_iter().collect();
@@ -825,7 +825,7 @@ impl Render for DragPreview {
     }
 }
 
-impl OpenDeckShell {
+impl RustyDeckShell {
     /// Device identity, with a swap control for choosing another device.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match &self.device {
@@ -1003,7 +1003,7 @@ impl OpenDeckShell {
     }
 }
 
-impl Render for OpenDeckShell {
+impl Render for RustyDeckShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let collapsed = window.viewport_size().width < px(SIDEBAR_BREAKPOINT);
 
