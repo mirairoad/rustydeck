@@ -4,7 +4,7 @@
 
 	<name>RustyDeck</name>
 	<summary>Use stream controllers</summary>
-	<developer id="me.amankhanna"><name>Aman Khanna</name></developer>
+	<developer id="io.github.mirairoad"><name>Leo Termine</name></developer>
 	<launchable type="desktop-id">rustydeck.desktop</launchable>
 
 	<url type="vcs-browser">https://github.com/mirairoad/rustydeck</url>

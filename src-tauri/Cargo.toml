@@ -2,7 +2,7 @@
 name = "rustydeck"
 version = "2.14.0"
 description = "Native Linux app for Stream Deck devices"
-# Forked from OpenDeck by Aman Khanna; see LICENSE.md (GPL-3.0-or-later).
+# Built on OpenDeck by Aman Khanna, whose backend this vendors; see README and LICENSE.md.
 authors = ["Leo Termine", "Aman Khanna (nekename)"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/mirairoad/rustydeck"
