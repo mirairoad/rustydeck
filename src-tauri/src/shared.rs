@@ -9,7 +9,6 @@ use serde_inline_default::serde_inline_default;
 use anyhow::{Result, bail};
 use dashmap::DashMap;
 use streamdeck_strip_render::{get_incremental_renderer, strip_renderer::StripRenderer};
-use tauri::Manager;
 use tokio::sync::RwLock;
 
 pub const PRODUCT_NAME: &str = include_str!("../../product_name.txt").trim_ascii();
@@ -48,15 +47,46 @@ pub struct DeviceInfo {
 pub static DEVICES: LazyLock<DashMap<String, DeviceInfo>> = LazyLock::new(DashMap::new);
 
 /// Get the application configuration directory.
+///
+/// A dotfolder in `$HOME` rather than the XDG config location: everything RustyDeck owns -
+/// profiles, plugins, images, custom actions and logs - lives together under one folder.
 pub fn config_dir() -> std::path::PathBuf {
-	let app_handle = crate::APP_HANDLE.get().unwrap();
-	app_handle.path().app_config_dir().unwrap()
+	dirs::home_dir().expect("a home directory").join(".rustydeck")
 }
 
 /// Get the application log directory.
 pub fn log_dir() -> std::path::PathBuf {
-	let app_handle = crate::APP_HANDLE.get().unwrap();
-	app_handle.path().app_log_dir().unwrap()
+	config_dir().join("logs")
+}
+
+/// Create the configuration tree on first run.
+///
+/// Called before anything else in `main`, because the logger is built from [`log_dir`] and the
+/// stores below it expect their directories to exist.
+pub fn initialise_config_dir() {
+	let root = config_dir();
+	for directory in ["plugins", "profiles", "images", "customs", "logs"] {
+		if let Err(error) = std::fs::create_dir_all(root.join(directory)) {
+			eprintln!("Failed to create {}: {error}", root.join(directory).display());
+		}
+	}
+}
+
+/// Get the directory the built-in plugins (multi-action, toggle-action) were compiled into.
+///
+/// Tauri resolved this via its bundled "Resource" directory; without that bundling step we look
+/// next to the running executable first (a plain installed build), falling back to the build.rs
+/// output directory in a dev build.
+pub fn builtin_plugins_dir() -> std::path::PathBuf {
+	if let Ok(exe) = std::env::current_exe()
+		&& let Some(dir) = exe.parent()
+	{
+		let candidate = dir.join("plugins");
+		if candidate.is_dir() {
+			return candidate;
+		}
+	}
+	Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("plugins")
 }
 
 /// Get whether or not the application is running inside the Flatpak sandbox.

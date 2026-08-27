@@ -1,15 +1,17 @@
+// This whole module is the direct-call API surface that replaces the old Tauri IPC commands.
+// Nothing calls most of it yet - the GPUI shell that will is milestone 3.
+#![allow(dead_code)]
+
 pub mod instances;
 pub mod plugins;
 pub mod profiles;
 pub mod property_inspector;
 pub mod settings;
 
+use crate::frontend_events::{FrontendEvent, emit};
 use crate::shared::{CATEGORIES, Category, DEVICES, DeviceInfo};
 
 use std::collections::HashMap;
-
-use font_loader::system_fonts;
-use tauri::{Emitter, Manager, command};
 
 #[derive(Debug, serde_with::SerializeDisplay, serde::Deserialize)]
 pub struct Error {
@@ -48,32 +50,26 @@ impl From<anyhow::Error> for Error {
 	}
 }
 
-#[command]
-pub async fn restart(app: tauri::AppHandle) {
-	app.restart();
+pub async fn restart() {
+	crate::restart_app();
 }
 
-#[command]
 pub async fn get_devices() -> dashmap::DashMap<String, DeviceInfo> {
 	DEVICES.clone()
 }
 
 pub async fn update_devices() {
-	let app = crate::APP_HANDLE.get().unwrap();
-	let _ = app.get_webview_window("main").unwrap().emit("devices", DEVICES.clone());
+	emit(FrontendEvent::Devices(DEVICES.clone()));
 }
 
-#[command]
 pub async fn get_port_base() -> u16 {
 	*crate::plugins::PORT_BASE
 }
 
-#[command]
 pub async fn get_categories() -> HashMap<String, Category> {
 	CATEGORIES.read().await.clone()
 }
 
-#[command]
 pub async fn get_localisations(locale: &str) -> Result<HashMap<String, serde_json::Value>, Error> {
 	let mut localisations: HashMap<String, serde_json::Value> = HashMap::new();
 
@@ -100,24 +96,20 @@ pub async fn get_localisations(locale: &str) -> Result<HashMap<String, serde_jso
 	Ok(localisations)
 }
 
-#[command]
 pub async fn get_applications() -> Vec<String> {
 	crate::application_watcher::APPLICATIONS.read().await.clone()
 }
 
-#[command]
 pub async fn get_application_profiles() -> crate::application_watcher::ApplicationProfiles {
 	crate::application_watcher::APPLICATION_PROFILES.read().await.value.clone()
 }
 
-#[command]
 pub async fn set_application_profiles(value: crate::application_watcher::ApplicationProfiles) -> Result<(), Error> {
 	let mut store = crate::application_watcher::APPLICATION_PROFILES.write().await;
 	store.value = value;
 	Ok(store.save()?)
 }
 
-#[command]
 pub fn get_fonts() -> Vec<String> {
-	system_fonts::query_all()
+	font_kit::source::SystemSource::new().all_families().unwrap_or_default()
 }

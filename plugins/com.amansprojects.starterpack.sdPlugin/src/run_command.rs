@@ -44,21 +44,34 @@ async fn run_command(
 		value = value.replace("%d", &ticks.to_string());
 	}
 
+	// Run through the session's login shell rather than plain `sh`, so aliases and shell functions
+	// resolve the way they do in a terminal. Omarchy, for example, provides `open` as a bash
+	// function: it works when typed but is invisible to a non-interactive POSIX shell, which makes
+	// a perfectly good command appear to do nothing at all.
+	#[cfg(unix)]
+	let login_shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned());
+	#[cfg(unix)]
+	let shell_args = ["-lic"];
+
 	#[cfg(unix)]
 	let command = if is_flatpak() {
-		"flatpak-spawn"
+		"flatpak-spawn".to_owned()
 	} else if is_distrobox() && !value.trim().starts_with("distrobox-host-exec") {
-		"distrobox-host-exec"
+		"distrobox-host-exec".to_owned()
 	} else {
-		"sh"
+		login_shell.clone()
 	};
 	#[cfg(unix)]
-	let extra_args = if is_flatpak() {
-		vec!["--host", "sh", "-c"]
+	let extra_args: Vec<&str> = if is_flatpak() {
+		let mut args = vec!["--host", login_shell.as_str()];
+		args.extend(shell_args);
+		args
 	} else if is_distrobox() && !value.trim().starts_with("distrobox-host-exec") {
-		vec!["sh", "-c"]
+		let mut args = vec![login_shell.as_str()];
+		args.extend(shell_args);
+		args
 	} else {
-		vec!["-c"]
+		shell_args.to_vec()
 	};
 
 	#[cfg(windows)]
@@ -150,6 +163,20 @@ impl Action for RunCommandAction {
 		settings: &Self::Settings,
 	) -> OpenActionResult<()> {
 		self.key_up(instance, settings).await
+	}
+
+	/// Tapping the touch strip runs the same command as a press.
+	///
+	/// Needs openaction >= 2.7: 2.6 had no `touchTap` event at all, so taps arrived as an unknown
+	/// event and were dropped with a warning.
+	async fn touch_tap(
+		&self,
+		instance: &Instance,
+		settings: &Self::Settings,
+		_position: (u16, u16),
+		_hold: bool,
+	) -> OpenActionResult<()> {
+		self.key_down(instance, settings).await
 	}
 
 	async fn dial_rotate(

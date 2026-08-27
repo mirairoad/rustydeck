@@ -1,16 +1,13 @@
 use super::Error;
 
+use crate::frontend_events::{FrontendEvent, emit};
 use crate::shared::DEVICES;
 use crate::store::profiles::{PROFILE_STORES, acquire_locks_mut, get_device_profiles, save_profile_now};
 
-use tauri::{AppHandle, Emitter, Manager, command};
-
-#[command]
 pub fn get_profiles(device: &str) -> Result<Vec<String>, Error> {
 	Ok(get_device_profiles(device)?)
 }
 
-#[command]
 pub async fn get_selected_profile(device: String) -> Result<crate::shared::Profile, Error> {
 	let mut locks = acquire_locks_mut().await;
 	if !DEVICES.contains_key(&device) {
@@ -24,7 +21,6 @@ pub async fn get_selected_profile(device: String) -> Result<crate::shared::Profi
 }
 
 #[allow(clippy::flat_map_identity)]
-#[command]
 pub async fn set_selected_profile(device: String, id: String) -> Result<(), Error> {
 	let mut locks = acquire_locks_mut().await;
 	if !DEVICES.contains_key(&device) {
@@ -83,13 +79,11 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), Erro
 	Ok(())
 }
 
-#[command]
 pub async fn delete_profile(device: String, profile: String) {
 	let mut profile_stores = PROFILE_STORES.write().await;
 	profile_stores.delete_profile(&device, &profile);
 }
 
-#[command]
 pub async fn rename_profile(device: String, old_id: String, new_id: String, retain: bool) -> Result<(), Error> {
 	let mut locks = acquire_locks_mut().await;
 	if !DEVICES.contains_key(&device) {
@@ -101,8 +95,7 @@ pub async fn rename_profile(device: String, old_id: String, new_id: String, reta
 	Ok(())
 }
 
-pub async fn rerender_images(app: &AppHandle) -> Result<(), anyhow::Error> {
-	let window = app.get_webview_window("main").unwrap();
-	window.emit("rerender_images", ())?;
+pub async fn rerender_images() -> Result<(), anyhow::Error> {
+	emit(FrontendEvent::RerenderImages);
 	Ok(())
 }

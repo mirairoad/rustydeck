@@ -1,13 +1,12 @@
 use super::Error;
 
+use crate::frontend_events::{FrontendEvent, emit};
 use crate::shared::{Action, ActionContext, ActionInstance, ActionState, Context, config_dir};
 use crate::store::profiles::{LocksMut, acquire_locks, acquire_locks_mut, get_instance_mut, get_slot, get_slot_mut, save_profile_now};
 
-use tauri::{AppHandle, Emitter, Manager, command};
 use tokio::fs::remove_dir_all;
 
-#[command]
-pub async fn create_instance(app: AppHandle, mut action: Action, context: Context) -> Result<Option<ActionInstance>, Error> {
+pub async fn create_instance(mut action: Action, context: Context) -> Result<Option<ActionInstance>, Error> {
 	if !action.controllers.contains(&context.controller) {
 		return Ok(None);
 	}
@@ -41,7 +40,7 @@ pub async fn create_instance(app: AppHandle, mut action: Action, context: Contex
 				image: "opendeck/toggle-action.png".to_owned(),
 				..Default::default()
 			});
-			let _ = update_state(&app, parent.context.clone(), &mut locks).await;
+			let _ = update_state(parent.context.clone(), &mut locks).await;
 		}
 
 		save_profile_now(&context.device, &mut locks).await?;
@@ -83,7 +82,91 @@ fn instance_images_dir(context: &ActionContext) -> std::path::PathBuf {
 		.join(format!("{}.{}.{}", context.controller, context.position, context.index))
 }
 
-#[command]
+/// Rewrite an instance's context - and its children's - for a new slot.
+///
+/// Note that child instances have their images reset to the action's defaults: custom per-child
+/// images have never survived a relocation, and that behaviour is preserved here.
+fn relocate(instance: &ActionInstance, destination: &Context) -> ActionInstance {
+	let mut new = instance.clone();
+	new.context = ActionContext::from_context(destination.clone(), 0);
+	if let Some(children) = &mut new.children {
+		for (index, instance) in children.iter_mut().enumerate() {
+			instance.context = ActionContext::from_context(destination.clone(), index as u16 + 1);
+			for (i, state) in instance.states.iter_mut().enumerate() {
+				if !instance.action.states[i].image.is_empty() {
+					state.image = instance.action.states[i].image.clone();
+				} else {
+					state.image = instance.action.icon.clone();
+				}
+			}
+		}
+	}
+	new
+}
+
+/// Repoint any state images that live inside the slot's own image directory at its new location.
+/// Images from elsewhere (a plugin's bundled icons, say) are left alone.
+fn rewrite_image_paths(instance: &mut ActionInstance, old_dir: &std::path::Path, new_dir: &std::path::Path) {
+	for state in instance.states.iter_mut() {
+		let path = std::path::Path::new(&state.image);
+		if path.starts_with(old_dir) {
+			state.image = new_dir.join(path.strip_prefix(old_dir).unwrap()).to_string_lossy().into_owned();
+		}
+	}
+}
+
+/// Exchange the instances in two occupied slots.
+///
+/// `move_instance` deliberately refuses to overwrite an occupied destination, so dragging one key
+/// on top of another needs its own operation - both instances are relocated into each other's slot
+/// under a single lock.
+pub async fn swap_instances(source: Context, destination: Context) -> Result<bool, Error> {
+	if source.controller != destination.controller || source == destination {
+		return Ok(false);
+	}
+
+	let mut locks = acquire_locks_mut().await;
+
+	let Some(source_instance) = get_slot_mut(&source, &mut locks).await?.clone() else {
+		return Ok(false);
+	};
+	let Some(destination_instance) = get_slot_mut(&destination, &mut locks).await?.clone() else {
+		return Ok(false);
+	};
+
+	let source_dir = instance_images_dir(&source_instance.context);
+	let destination_dir = instance_images_dir(&destination_instance.context);
+
+	let mut moved_to_destination = relocate(&source_instance, &destination);
+	let mut moved_to_source = relocate(&destination_instance, &source);
+
+	// Exchange the two slots' image directories through a staging path, so neither is overwritten
+	// before it has been moved clear.
+	let staging = source_dir.with_file_name(format!(".swap-{}", std::process::id()));
+	let _ = remove_dir_all(&staging).await;
+	let _ = tokio::fs::rename(&source_dir, &staging).await;
+	let _ = tokio::fs::rename(&destination_dir, &source_dir).await;
+	let _ = tokio::fs::rename(&staging, &destination_dir).await;
+
+	rewrite_image_paths(&mut moved_to_destination, &source_dir, &destination_dir);
+	rewrite_image_paths(&mut moved_to_source, &destination_dir, &source_dir);
+
+	// Both instances leave their old slots before either arrives at its new one, so plugins never
+	// see two instances claiming the same position.
+	let _ = crate::events::outbound::will_appear::will_disappear(&source_instance, true).await;
+	let _ = crate::events::outbound::will_appear::will_disappear(&destination_instance, true).await;
+
+	*get_slot_mut(&destination, &mut locks).await? = Some(moved_to_destination.clone());
+	*get_slot_mut(&source, &mut locks).await? = Some(moved_to_source.clone());
+
+	let _ = crate::events::outbound::will_appear::will_appear(&moved_to_destination).await;
+	let _ = crate::events::outbound::will_appear::will_appear(&moved_to_source).await;
+
+	save_profile_now(&destination.device, &mut locks).await?;
+
+	Ok(true)
+}
+
 pub async fn move_instance(source: Context, destination: Context, retain: bool) -> Result<Option<ActionInstance>, Error> {
 	if source.controller != destination.controller {
 		return Ok(None);
@@ -100,24 +183,12 @@ pub async fn move_instance(source: Context, destination: Context, retain: bool) 
 	let mut locks = acquire_locks_mut().await;
 	let src = get_slot_mut(&source, &mut locks).await?;
 
-	let Some(mut new) = src.clone() else {
+	let Some(source_instance) = src.clone() else {
 		return Ok(None);
 	};
-	new.context = ActionContext::from_context(destination.clone(), 0);
-	if let Some(children) = &mut new.children {
-		for (index, instance) in children.iter_mut().enumerate() {
-			instance.context = ActionContext::from_context(destination.clone(), index as u16 + 1);
-			for (i, state) in instance.states.iter_mut().enumerate() {
-				if !instance.action.states[i].image.is_empty() {
-					state.image = instance.action.states[i].image.clone();
-				} else {
-					state.image = instance.action.icon.clone();
-				}
-			}
-		}
-	}
+	let mut new = relocate(&source_instance, &destination);
 
-	let old_dir = instance_images_dir(&src.as_ref().unwrap().context);
+	let old_dir = instance_images_dir(&source_instance.context);
 	let new_dir = instance_images_dir(&new.context);
 	let _ = tokio::fs::create_dir_all(&new_dir).await;
 	if let Ok(files) = old_dir.read_dir() {
@@ -125,12 +196,7 @@ pub async fn move_instance(source: Context, destination: Context, retain: bool) 
 			let _ = tokio::fs::copy(file.path(), new_dir.join(file.file_name())).await;
 		}
 	}
-	for state in new.states.iter_mut() {
-		let path = std::path::Path::new(&state.image);
-		if path.starts_with(&old_dir) {
-			state.image = new_dir.join(path.strip_prefix(&old_dir).unwrap()).to_string_lossy().into_owned();
-		}
-	}
+	rewrite_image_paths(&mut new, &old_dir, &new_dir);
 
 	let dst = get_slot_mut(&destination, &mut locks).await?;
 	*dst = Some(new.clone());
@@ -151,7 +217,6 @@ pub async fn move_instance(source: Context, destination: Context, retain: bool) 
 	Ok(Some(new))
 }
 
-#[command]
 pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 	let mut locks = acquire_locks_mut().await;
 	let slot = get_slot_mut(&(&context).into(), &mut locks).await?;
@@ -199,7 +264,7 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 			}
 			if !children.is_empty() {
 				instance.states.pop();
-				let _ = update_state(crate::APP_HANDLE.get().unwrap(), instance.context.clone(), &mut locks).await;
+				let _ = update_state(instance.context.clone(), &mut locks).await;
 			}
 		}
 	}
@@ -209,25 +274,12 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 	Ok(())
 }
 
-#[derive(Clone, serde::Serialize)]
-struct UpdateStateEvent {
-	context: ActionContext,
-	contents: Option<ActionInstance>,
-}
-
-pub async fn update_state(app: &AppHandle, context: ActionContext, locks: &mut LocksMut<'_>) -> Result<(), anyhow::Error> {
-	let window = app.get_webview_window("main").unwrap();
-	window.emit(
-		"update_state",
-		UpdateStateEvent {
-			contents: get_instance_mut(&context, locks).await?.cloned(),
-			context,
-		},
-	)?;
+pub async fn update_state(context: ActionContext, locks: &mut LocksMut<'_>) -> Result<(), anyhow::Error> {
+	let contents = get_instance_mut(&context, locks).await?.cloned();
+	emit(FrontendEvent::UpdateState { context, contents });
 	Ok(())
 }
 
-#[command]
 pub async fn set_state(context: ActionContext, index: u16, state: ActionState) -> Result<(), Error> {
 	let mut locks = acquire_locks_mut().await;
 	let reference = get_instance_mut(&context, &mut locks).await?.unwrap();
@@ -238,7 +290,6 @@ pub async fn set_state(context: ActionContext, index: u16, state: ActionState) -
 	Ok(())
 }
 
-#[command]
 pub async fn set_child_delay(parent_context: ActionContext, index: usize, delay_ms: u64) -> Result<serde_json::Value, Error> {
 	let mut locks = acquire_locks_mut().await;
 	let Some(parent) = get_instance_mut(&parent_context, &mut locks).await? else {
@@ -266,7 +317,6 @@ pub async fn set_child_delay(parent_context: ActionContext, index: usize, delay_
 	Ok(parent_settings)
 }
 
-#[command]
 pub async fn update_image(context: Context, image: Option<String>) {
 	if Some(&context.profile) != crate::store::profiles::DEVICE_STORES.write().await.get_selected_profile(&context.device).ok().as_ref() {
 		return;
@@ -277,7 +327,6 @@ pub async fn update_image(context: Context, image: Option<String>) {
 	}
 }
 
-#[command]
 pub async fn trigger_virtual_press(context: Context) -> Result<(), Error> {
 	let event = || crate::events::inbound::PayloadEvent {
 		payload: crate::events::inbound::devices::PressPayload {
@@ -302,14 +351,7 @@ pub async fn trigger_virtual_press(context: Context) -> Result<(), Error> {
 	Ok(())
 }
 
-#[derive(Clone, serde::Serialize)]
-struct KeyMovedEvent {
-	context: Context,
-	pressed: bool,
-}
-
-pub async fn key_moved(app: &AppHandle, context: Context, pressed: bool) -> Result<(), anyhow::Error> {
-	let window = app.get_webview_window("main").unwrap();
-	window.emit("key_moved", KeyMovedEvent { context, pressed })?;
+pub async fn key_moved(context: Context, pressed: bool) -> Result<(), anyhow::Error> {
+	emit(FrontendEvent::KeyMoved { context, pressed });
 	Ok(())
 }

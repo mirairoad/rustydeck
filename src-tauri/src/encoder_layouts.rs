@@ -37,11 +37,16 @@ pub async fn generate_encoder_image(context: &crate::shared::Context, fallback: 
 			trace!("No encoder instance / config found for action; using fallback image");
 
 			let mut fallback_canvas = RgbaImage::from_pixel(200, 100, Rgba([0, 0, 0, 255]));
+			// Fit the supplied image to the strip region rather than shrinking it to a fixed
+			// 72x72 thumbnail: the shell now composites at the region's own 200x100 aspect, so
+			// this fills the segment instead of leaving most of it black.
 			let fallback_img = image::load_from_memory(fallback)
 				.context("Failed to decode fallback image")?
-				.resize(72, 72, image::imageops::FilterType::Nearest);
+				.resize(200, 100, image::imageops::FilterType::Lanczos3);
 
-			overlay(&mut fallback_canvas, &fallback_img.to_rgba8(), 64, 14);
+			let x = (200 - fallback_img.width() as i64) / 2;
+			let y = (100 - fallback_img.height() as i64) / 2;
+			overlay(&mut fallback_canvas, &fallback_img.to_rgba8(), x, y);
 
 			Ok(DynamicImage::ImageRgba8(fallback_canvas))
 		}

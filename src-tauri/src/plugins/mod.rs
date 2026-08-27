@@ -2,16 +2,13 @@ pub mod info_param;
 pub mod manifest;
 mod webserver;
 
-use crate::APP_HANDLE;
 use crate::built_info::TARGET;
-use crate::shared::{CATEGORIES, Category, config_dir, convert_icon, is_flatpak, log_dir};
+use crate::shared::{CATEGORIES, Category, builtin_plugins_dir, config_dir, convert_icon, is_flatpak, log_dir};
 
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::{LazyLock, mpsc};
+use std::sync::{LazyLock, OnceLock, mpsc};
 use std::{fs, path};
-
-use tauri::{AppHandle, Manager};
 
 use futures::StreamExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -66,6 +63,13 @@ fn attach_parent_death_signal(command: &mut Command) {
 }
 
 pub type SpawnRequest = Box<dyn FnOnce() -> Result<(String, PluginChildType, Command), anyhow::Error> + Send>;
+
+static SPAWN_REQUEST_TX: OnceLock<mpsc::Sender<SpawnRequest>> = OnceLock::new();
+
+/// A sender for requesting a plugin process spawn, set up once `initialise_plugins` has run.
+pub fn spawn_request_tx() -> mpsc::Sender<SpawnRequest> {
+	SPAWN_REQUEST_TX.get().expect("initialise_plugins must run before plugins can be spawned").clone()
+}
 
 /// Initialise a plugin from a given directory.
 pub async fn initialise_plugin(path: path::PathBuf, spawner_tx: mpsc::Sender<SpawnRequest>) -> anyhow::Result<()> {
@@ -212,37 +216,11 @@ pub async fn initialise_plugin(path: path::PathBuf, spawner_tx: mpsc::Sender<Spa
 	];
 
 	if code_path.to_lowercase().ends_with(".html") || code_path.to_lowercase().ends_with(".htm") || code_path.to_lowercase().ends_with(".xhtml") {
-		let url = format!("http://localhost:{}/", *PORT_BASE + 2) + path.join(code_path).to_str().unwrap();
-		let window = tauri::WebviewWindowBuilder::new(APP_HANDLE.get().unwrap(), plugin_uuid.replace('.', "_"), tauri::WebviewUrl::External(url.parse()?))
-			.title(manifest.name)
-			.visible(false)
-			.build()?;
-
-		if fs::exists(path.join("debug")).unwrap_or(false) {
-			let _ = window.show();
-			window.open_devtools();
-		}
-
-		let info = info_param::make_info(plugin_uuid.to_owned(), manifest.version, false).await;
-		window.eval(format!(
-			r#"const opendeckInit = () => {{
-				try {{
-					if (document.readyState !== "complete") throw new Error("not ready");
-					if (typeof connectOpenActionSocket === "function") connectOpenActionSocket({port}, "{uuid}", "{event}", `{info}`);
-					else connectElgatoStreamDeckSocket({port}, "{uuid}", "{event}", `{info}`);
-				}} catch (e) {{
-					setTimeout(opendeckInit, 10);
-				}}
-			}};
-			opendeckInit();
-			"#,
-			port = *PORT_BASE,
-			uuid = plugin_uuid,
-			event = "registerPlugin",
-			info = serde_json::to_string(&info)?
-		))?;
-
-		INSTANCES.lock().await.insert(plugin_uuid, PluginInstance::Webview);
+		// HTML-based plugin backends run inside a hidden webview under Tauri. GPUI has no
+		// built-in webview; this is pending the `wry` embed planned for the property-inspector
+		// milestone, which needs to cover this case too. See PRD milestone 4 / the milestone-2
+		// plan's "not touched" list.
+		return Err(anyhow!("HTML-based plugin backends aren't supported yet (plugin {})", plugin_uuid));
 	} else if code_path.to_lowercase().ends_with(".js") || code_path.to_lowercase().ends_with(".mjs") || code_path.to_lowercase().ends_with(".cjs") {
 		// Check for Node.js installation and version in one go.
 		let command = if is_flatpak() { "flatpak-spawn" } else { "node" };
@@ -355,7 +333,7 @@ pub async fn initialise_plugin(path: path::PathBuf, spawner_tx: mpsc::Sender<Spa
 	Ok(())
 }
 
-pub async fn deactivate_plugin(app: &AppHandle, uuid: &str) -> Result<(), anyhow::Error> {
+pub async fn deactivate_plugin(uuid: &str) -> Result<(), anyhow::Error> {
 	{
 		let mut namespaces = DEVICE_NAMESPACES.write().await;
 		if let Some((namespace, _)) = namespaces.clone().iter().find(|(_, plugin)| uuid == **plugin) {
@@ -374,10 +352,7 @@ pub async fn deactivate_plugin(app: &AppHandle, uuid: &str) -> Result<(), anyhow
 	if let Some(instance) = INSTANCES.lock().await.remove(uuid) {
 		match instance {
 			PluginInstance::Webview => {
-				if let Some(window) = app.get_webview_window(&uuid.replace('.', "_")) {
-					window.close()?;
-					tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-				}
+				warn!("Plugin {} is an HTML-based backend, which isn't supported yet - nothing to deactivate", uuid);
 			}
 			PluginInstance::Node(mut child) | PluginInstance::Wine(mut child) | PluginInstance::Native(mut child) => {
 				child.kill()?;
@@ -412,7 +387,7 @@ pub fn initialise_plugins() {
 	let _ = fs::create_dir_all(&plugin_dir);
 	let _ = fs::create_dir_all(log_dir().join("plugins"));
 
-	if let Ok(Ok(entries)) = APP_HANDLE.get().unwrap().path().resolve("plugins", tauri::path::BaseDirectory::Resource).map(fs::read_dir) {
+	if let Ok(entries) = fs::read_dir(builtin_plugins_dir()) {
 		for entry in entries.flatten() {
 			if let Err(error) = (|| -> Result<(), anyhow::Error> {
 				let builtin_version = semver::Version::parse(&serde_json::from_slice::<manifest::PluginManifest>(&fs::read(entry.path().join("manifest.json"))?)?.version)?;
@@ -451,7 +426,7 @@ pub fn initialise_plugins() {
 	};
 
 	let (tx, rx) = mpsc::channel::<SpawnRequest>();
-	APP_HANDLE.get().unwrap().manage(tx.clone());
+	SPAWN_REQUEST_TX.set(tx.clone()).ok();
 
 	// Use a dedicated spawner thread so that plugin processes don't die due to PR_SET_PDEATHSIG when the parent Tokio worker exits
 	std::thread::spawn(|| {
@@ -496,22 +471,6 @@ pub fn initialise_plugins() {
 		}
 	}
 
-	// On macOS, hidden WKWebView windows suspend JavaScript after ~7s.
-	// Periodically eval a no-op to keep them alive.
-	#[cfg(target_os = "macos")]
-	tokio::spawn(async {
-		use tauri::Manager;
-		let app = APP_HANDLE.get().unwrap();
-		loop {
-			tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-			let instances = INSTANCES.lock().await;
-			for (uuid, _) in instances.iter().filter(|(_, instance)| matches!(instance, PluginInstance::Webview)) {
-				if let Some(window) = app.get_webview_window(&uuid.replace('.', "_")) {
-					let _ = window.eval("void(0);");
-				}
-			}
-		}
-	});
 }
 
 /// Start the WebSocket server that plugins communicate with.

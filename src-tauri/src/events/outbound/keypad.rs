@@ -31,7 +31,7 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		position: key,
 	};
 
-	let _ = key_moved(crate::APP_HANDLE.get().unwrap(), context.clone(), true).await;
+	let _ = key_moved(context.clone(), true).await;
 	KEY_DOWN_TARGETS.insert((device.to_owned(), key), context.clone());
 
 	let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
@@ -91,7 +91,7 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 			}
 
 			for child in children.iter().map(|x| x.context.clone()).collect::<Vec<_>>() {
-				let _ = update_state(crate::APP_HANDLE.get().unwrap(), child, &mut locks).await;
+				let _ = update_state(child, &mut locks).await;
 			}
 		}
 
@@ -140,7 +140,7 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		position: key,
 	};
 
-	let _ = key_moved(crate::APP_HANDLE.get().unwrap(), context.clone(), false).await;
+	let _ = key_moved(context.clone(), false).await;
 	let Some((_, expected_context)) = KEY_DOWN_TARGETS.remove(&(device.to_owned(), key)) else {
 		return Ok(());
 	};
@@ -187,7 +187,7 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		.await?;
 	};
 
-	let _ = update_state(crate::APP_HANDLE.get().unwrap(), instance.context.clone(), &mut locks).await;
+	let _ = update_state(instance.context.clone(), &mut locks).await;
 	mark_profile_stale(device, &mut locks).await?;
 
 	Ok(())
