@@ -1,7 +1,7 @@
 /// <reference lib="deno.ns" />
 
 const ROOT = new URL("../", import.meta.url);
-const METAINFO = new URL("../src-tauri/bundle/opendeck.metainfo.xml", import.meta.url);
+const METAINFO = new URL("../src-tauri/bundle/rustydeck.metainfo.xml", import.meta.url);
 const STARTERPACK_MANIFEST = new URL("../plugins/com.amansprojects.starterpack.sdPlugin/assets/manifest.json", import.meta.url);
 
 function usage(): never {

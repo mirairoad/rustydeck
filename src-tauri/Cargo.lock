@@ -4985,56 +4985,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opendeck"
-version = "2.14.0"
-dependencies = [
- "ab_glyph",
- "active-win-pos-rs",
- "anyhow",
- "base64",
- "built",
- "chrono",
- "dashmap",
- "dirs 6.0.0",
- "elgato-streamdeck",
- "fix-path-env",
- "futures",
- "gpui",
- "gpui-component",
- "gpui-component-assets",
- "gtk",
- "hidapi",
- "image",
- "json-patch",
- "libc",
- "log",
- "log-panics",
- "open",
- "os_info",
- "path-slash",
- "psp",
- "reqwest",
- "resvg 0.45.1",
- "rfd",
- "semver",
- "serde",
- "serde-inline-default",
- "serde_json",
- "serde_with",
- "simplelog",
- "streamdeck-strip-render",
- "sysinfo 0.38.0",
- "tiny_http",
- "tokio",
- "tokio-tungstenite",
- "tray-icon",
- "urlencoding",
- "windows-sys 0.61.2",
- "zed-font-kit",
- "zip",
-]
-
-[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6440,6 +6390,56 @@ dependencies = [
  "unicode-ccc 0.4.0",
  "unicode-properties",
  "unicode-script",
+]
+
+[[package]]
+name = "rustydeck"
+version = "2.14.0"
+dependencies = [
+ "ab_glyph",
+ "active-win-pos-rs",
+ "anyhow",
+ "base64",
+ "built",
+ "chrono",
+ "dashmap",
+ "dirs 6.0.0",
+ "elgato-streamdeck",
+ "fix-path-env",
+ "futures",
+ "gpui",
+ "gpui-component",
+ "gpui-component-assets",
+ "gtk",
+ "hidapi",
+ "image",
+ "json-patch",
+ "libc",
+ "log",
+ "log-panics",
+ "open",
+ "os_info",
+ "path-slash",
+ "psp",
+ "reqwest",
+ "resvg 0.45.1",
+ "rfd",
+ "semver",
+ "serde",
+ "serde-inline-default",
+ "serde_json",
+ "serde_with",
+ "simplelog",
+ "streamdeck-strip-render",
+ "sysinfo 0.38.0",
+ "tiny_http",
+ "tokio",
+ "tokio-tungstenite",
+ "tray-icon",
+ "urlencoding",
+ "windows-sys 0.61.2",
+ "zed-font-kit",
+ "zip",
 ]
 
 [[package]]

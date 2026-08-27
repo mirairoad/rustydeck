@@ -107,7 +107,7 @@ fn spawn_tray_thread() {
 		let _ = menu.append(&quit);
 
 		let _tray = match tray_icon::TrayIconBuilder::new()
-			.with_id("opendeck")
+			.with_id("rustydeck")
 			.with_menu(Box::new(menu))
 			.with_icon(tray_icon_image())
 			.with_tooltip(PRODUCT_NAME)

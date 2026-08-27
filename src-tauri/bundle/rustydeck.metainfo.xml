@@ -1,17 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-	<id>opendeck</id>
+	<id>rustydeck</id>
 
-	<name>OpenDeck</name>
+	<name>RustyDeck</name>
 	<summary>Use stream controllers</summary>
 	<developer id="me.amankhanna"><name>Aman Khanna</name></developer>
-	<launchable type="desktop-id">opendeck.desktop</launchable>
+	<launchable type="desktop-id">rustydeck.desktop</launchable>
 
-	<url type="vcs-browser">https://github.com/nekename/OpenDeck</url>
-	<url type="homepage">https://github.com/nekename/OpenDeck</url>
-	<url type="bugtracker">https://github.com/nekename/OpenDeck/issues</url>
-	<url type="faq">https://github.com/nekename/OpenDeck?tab=readme-ov-file#support</url>
-	<url type="contribute">https://github.com/nekename/OpenDeck?tab=readme-ov-file#building-from-source--contributing</url>
+	<url type="vcs-browser">https://github.com/mirairoad/rustydeck</url>
+	<url type="homepage">https://github.com/mirairoad/rustydeck</url>
+	<url type="bugtracker">https://github.com/mirairoad/rustydeck/issues</url>
+	<url type="faq">https://github.com/mirairoad/rustydeck?tab=readme-ov-file#support</url>
+	<url type="contribute">https://github.com/mirairoad/rustydeck?tab=readme-ov-file#building-from-source--contributing</url>
 	<url type="donation">https://github.com/sponsors/nekename</url>
 	<url type="contact">https://discord.gg/26Nf8rHvaj</url>
 
@@ -30,19 +30,19 @@
 
 	<screenshots>
 		<screenshot type="default">
-			<image>https://github.com/nekename/OpenDeck/raw/release/.github/readme/mainmenu.png</image>
+			<image>https://github.com/mirairoad/rustydeck/raw/release/.github/readme/mainmenu.png</image>
 			<caption>Main menu</caption>
 		</screenshot>
 		<screenshot>
-			<image>https://github.com/nekename/OpenDeck/raw/release/.github/readme/multiaction.png</image>
+			<image>https://github.com/mirairoad/rustydeck/raw/release/.github/readme/multiaction.png</image>
 			<caption>Multi action</caption>
 		</screenshot>
 		<screenshot>
-			<image>https://github.com/nekename/OpenDeck/raw/release/.github/readme/plugins.png</image>
+			<image>https://github.com/mirairoad/rustydeck/raw/release/.github/readme/plugins.png</image>
 			<caption>Plugins</caption>
 		</screenshot>
 		<screenshot>
-			<image>https://github.com/nekename/OpenDeck/raw/release/.github/readme/profiles.png</image>
+			<image>https://github.com/mirairoad/rustydeck/raw/release/.github/readme/profiles.png</image>
 			<caption>Profiles</caption>
 		</screenshot>
 	</screenshots>
@@ -54,7 +54,7 @@
 
 	<releases>
 		<release version="2.14.0" date="2026-07-29">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.14.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.14.0</url>
 			<description>
 				<ul>
 					<li>fix: gracefully handle missing iframes during property inspector initialisation</li>
@@ -82,7 +82,7 @@
 			</description>
 		</release>
 		<release version="2.13.1" date="2026-06-27">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.13.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.13.1</url>
 			<description>
 				<ul>
 					<li>fix: resolve missing localisation keys in ParentActionView and consolidate its key namespace</li>
@@ -92,7 +92,7 @@
 			</description>
 		</release>
 		<release version="2.13.0" date="2026-06-26">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.13.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.13.0</url>
 			<description>
 				<ul>
 					<li>chore: sync formatting changes introduced by a Deno formatter update</li>
@@ -116,7 +116,7 @@
 			</description>
 		</release>
 		<release version="2.12.1" date="2026-05-30">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.12.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.12.1</url>
 			<description>
 				<ul>
 					<li>fix: use plugin name as window title for web-based plugins</li>
@@ -128,7 +128,7 @@
 			</description>
 		</release>
 		<release version="2.12.0" date="2026-05-03">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.12.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.12.0</url>
 			<description>
 				<ul>
 					<li>docs: update issue and pull request preflight checklists to require higher quality submissions</li>
@@ -148,7 +148,7 @@
 			</description>
 		</release>
 		<release version="2.11.1" date="2026-04-09">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.11.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.11.1</url>
 			<description>
 				<ul>
 					<li>fix: replace usage of Tauri currentMonitor method with window.screen API to avoid GNOME X11 crash (#301)</li>
@@ -161,7 +161,7 @@
 			</description>
 		</release>
 		<release version="2.11.0" date="2026-04-02">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.11.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.11.0</url>
 			<description>
 				<ul>
 					<li>feat: add controls for customising image scale (#268)</li>
@@ -185,7 +185,7 @@
 			</description>
 		</release>
 		<release version="2.10.1" date="2026-03-21">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.10.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.10.1</url>
 			<description>
 				<ul>
 					<li>fix: accept event argument directly in property inspector message handlers instead of destructuring</li>
@@ -197,7 +197,7 @@
 			</description>
 		</release>
 		<release version="2.10.0" date="2026-02-28">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.10.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.10.0</url>
 			<description>
 				<ul>
 					<li>refactor: replace svelte.config.js with svelte.config.ts to eliminate untyped code</li>
@@ -220,7 +220,7 @@
 			</description>
 		</release>
 		<release version="2.9.1" date="2026-02-14">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.9.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.9.1</url>
 			<description>
 				<ul>
 					<li>chore: sync lockfile changes made by `deno install` after earlier commit regarding displaying GFM alerts</li>
@@ -230,7 +230,7 @@
 			</description>
 		</release>
 		<release version="2.9.0" date="2026-02-08">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.9.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.9.0</url>
 			<description>
 				<ul>
 					<li>fix: always underline available plugin version element to highlight that it is clickable</li>
@@ -265,7 +265,7 @@
 			</description>
 		</release>
 		<release version="2.8.2" date="2026-01-18">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.8.2</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.8.2</url>
 			<description>
 				<ul>
 					<li>fix: ensure prefix is also canonicalised before matching in webserver request handler</li>
@@ -273,7 +273,7 @@
 			</description>
 		</release>
 		<release version="2.8.1" date="2026-01-17">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.8.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.8.1</url>
 			<description>
 				<ul>
 					<li>feat: load font list from system installed fonts</li>
@@ -288,7 +288,7 @@
 			</description>
 		</release>
 		<release version="2.8.0" date="2026-01-03">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.8.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.8.0</url>
 			<description>
 				<ul>
 					<li>chore: run rustfmt on code fixed automatically by clippy</li>
@@ -318,7 +318,7 @@
 			</description>
 		</release>
 		<release version="2.7.1" date="2025-12-03">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.7.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.7.1</url>
 			<description>
 				<ul>
 					<li>Prevent setting the current state of an action out of the bounds of its possible states</li>
@@ -337,7 +337,7 @@
 			</description>
 		</release>
 		<release version="2.7.0" date="2025-11-08">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.7.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.7.0</url>
 			<description>
 				<ul>
 					<li>Use alternative ports if default ports are already in use</li>
@@ -355,7 +355,7 @@
 			</description>
 		</release>
 		<release version="2.6.1" date="2025-09-29">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.6.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.6.1</url>
 			<description>
 				<ul>
 					<li>Remove app_exited event due to limited function</li>
@@ -377,7 +377,7 @@
 			</description>
 		</release>
 		<release version="2.6.0" date="2025-08-30">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.6.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.6.0</url>
 			<description>
 				<ul>
 					<li>Create automated installation script</li>
@@ -394,7 +394,7 @@
 			</description>
 		</release>
 		<release version="2.5.1" date="2025-08-11">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.5.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.5.1</url>
 			<description>
 				<ul>
 					<li>Allow leaving keys pressed in Input Simulation commands</li>
@@ -404,7 +404,7 @@
 			</description>
 		</release>
 		<release version="2.5.0" date="2025-06-15">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.5.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.5.0</url>
 			<description>
 				<ul>
 					<li>Support configuring a 'default profile'</li>
@@ -430,19 +430,19 @@
 			</description>
 		</release>
 		<release version="2.4.4" date="2025-04-18">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.4.4</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.4.4</url>
 			<description>
 				<p>This release contains a fix for Mirabox device support that was accidentally removed in the previous release. This is the last release to support Mirabox devices.</p>
 			</description>
 		</release>
 		<release version="2.4.3" date="2025-04-17">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.4.3</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.4.3</url>
 			<description>
 				<p>This release contains two months' worth of bug fixes and improvements; see the commit timeline on GitHub for details.</p>
 			</description>
 		</release>
 		<release version="2.4.2" date="2025-02-18">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.4.2</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.4.2</url>
 			<description>
 				<ul>
 					<li>Highlight currently selected key</li>
@@ -451,7 +451,7 @@
 			</description>
 		</release>
 		<release version="2.4.1" date="2025-01-27">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.4.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.4.1</url>
 			<description>
 				<ul>
 					<li>Numerous bug fixes</li>
@@ -459,7 +459,7 @@
 			</description>
 		</release>
 		<release version="2.4.0" date="2025-01-23">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.4.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.4.0</url>
 			<description>
 				<ul>
 					<li>Plugin management improvements</li>
@@ -472,7 +472,7 @@
 			</description>
 		</release>
 		<release version="2.3.1" date="2024-12-17">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.3.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.3.1</url>
 			<description>
 				<ul>
 					<li>Fix instances being removed due to a race condition</li>
@@ -482,7 +482,7 @@
 			</description>
 		</release>
 		<release version="2.3.0" date="2024-12-16">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.3.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.3.0</url>
 			<description>
 				<ul>
 					<li>Support platform-specific manifest property overrides</li>
@@ -502,7 +502,7 @@
 			</description>
 		</release>
 		<release version="2.2.1" date="2024-11-03">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.2.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.2.1</url>
 			<description>
 				<ul>
 					<li>Documentation updates</li>
@@ -512,7 +512,7 @@
 			</description>
 		</release>
 		<release version="2.2.0" date="2024-10-14">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.2.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.2.0</url>
 			<description>
 				<ul>
 					<li>Preparations for Flatpak release</li>
@@ -522,13 +522,13 @@
 			</description>
 		</release>
 		<release version="2.1.1" date="2024-10-09">
-			<url type="details">https://github.com/nekename/OpenDeck/release/tag/v2.1.1</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/release/tag/v2.1.1</url>
 			<description>
 				<ul><li>Bug fix for blank screens</li></ul>
 			</description>
 		</release>
 		<release version="2.1.0" date="2024-10-03">
-			<url type="details">https://github.com/nekename/OpenDeck/releases/tag/v2.1.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/releases/tag/v2.1.0</url>
 			<description>
 				<ul>
 					<li>Changed license to the GNU GPL version 3 or later</li>
@@ -539,7 +539,7 @@
 			</description>
 		</release>
 		<release version="2.0.0" date="2024-09-07">
-			<url type="details">https://github.com/nekename/OpenDeck/release/tag/v2.0.0</url>
+			<url type="details">https://github.com/mirairoad/rustydeck/release/tag/v2.0.0</url>
 			<description>
 				<p>This is the first stable release of the completely rewritten version of OpenDeck</p>
 			</description>

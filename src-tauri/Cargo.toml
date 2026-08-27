@@ -1,11 +1,12 @@
 [package]
-name = "opendeck"
+name = "rustydeck"
 version = "2.14.0"
-description = "Use stream controllers"
-authors = ["Aman Khanna (nekename)"]
+description = "Native Linux app for Stream Deck devices"
+# Forked from OpenDeck by Aman Khanna; see LICENSE.md (GPL-3.0-or-later).
+authors = ["Leo Termine", "Aman Khanna (nekename)"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/nekename/OpenDeck"
-default-run = "opendeck"
+repository = "https://github.com/mirairoad/rustydeck"
+default-run = "rustydeck"
 edition = "2024"
 
 [build-dependencies]
