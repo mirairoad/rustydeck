@@ -13,6 +13,11 @@ use tokio::sync::RwLock;
 
 pub const PRODUCT_NAME: &str = include_str!("../../product_name.txt").trim_ascii();
 
+/// Built-in page-stepping actions, dispatched by UUID in `events::outbound::keypad` rather than
+/// being sent to a plugin - the same way `opendeck.multiaction` is handled.
+pub const PAGE_LEFT_UUID: &str = "rustydeck.pageleft";
+pub const PAGE_RIGHT_UUID: &str = "rustydeck.pageright";
+
 pub fn copy_dir(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), std::io::Error> {
 	use std::fs;
 	fs::create_dir_all(&dst)?;
@@ -504,6 +509,35 @@ pub static CATEGORIES: LazyLock<RwLock<HashMap<String, Category>>> = LazyLock::n
 						"tooltip": "Cycle through multiple actions",
 						"controllers": [ "Keypad" ],
 						"states": [ { "image": "opendeck/toggle-action.png" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				// Pages are profiles; these two step between them. Handled by UUID in
+				// `events::outbound::keypad`, so they need no plugin behind them. Artwork is
+				// still to come - an empty image composites to a plain key rather than failing.
+				serde_json::from_value(serde_json::json!(
+					{
+						"name": "Page Left",
+						"icon": "",
+						"plugin": "rustydeck",
+						"uuid": PAGE_LEFT_UUID,
+						"tooltip": "Switch to the previous page",
+						"controllers": [ "Keypad", "Encoder" ],
+						"states": [ { "image": "" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				serde_json::from_value(serde_json::json!(
+					{
+						"name": "Page Right",
+						"icon": "",
+						"plugin": "rustydeck",
+						"uuid": PAGE_RIGHT_UUID,
+						"tooltip": "Switch to the next page",
+						"controllers": [ "Keypad", "Encoder" ],
+						"states": [ { "image": "" } ],
 						"supported_in_multi_actions": false
 					}
 				))

@@ -23,9 +23,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CustomActionConfig {
+	/// Stable identity, generated once and never changed.
+	///
+	/// Deliberately not the directory name: renaming an action moves its directory, so anything
+	/// referencing it by slug would break exactly when the user renames it. Keys on the deck store
+	/// this id to stay linked to the action they were created from.
+	pub id: String,
 	pub name: String,
 	/// Runs on key press - written to the Run Command action's `settings.down`.
 	pub command: String,
+	/// For predefined entries: the UUID of the action to instantiate instead of Run Command.
+	/// When set, `command` is unused.
+	pub action: Option<String>,
 	/// The composited key face, relative to the action's own directory.
 	pub image: String,
 	/// The icon it was composited from, if any (PNG/JPEG/SVG), relative to the directory.
@@ -39,8 +48,10 @@ impl NotProfile for CustomActionConfig {}
 /// A stored action plus the directory name that identifies it.
 #[derive(Clone)]
 pub struct CustomAction {
-	/// Directory name under `customs/` - the action's identity, derived from its name.
+	/// Directory name within [`Self::root`] - derived from the action's name.
 	pub slug: String,
+	/// Which library this came from: the user's `customs/` or the shipped `predefined/`.
+	pub root: PathBuf,
 	pub config: CustomActionConfig,
 }
 
@@ -53,9 +64,22 @@ impl CustomAction {
 		&self.config.command
 	}
 
+	pub fn id(&self) -> &str {
+		&self.config.id
+	}
+
+	/// The built-in action this entry places, if it is not a shell command.
+	pub fn action_uuid(&self) -> Option<&str> {
+		self.config.action.as_deref()
+	}
+
+	fn dir(&self) -> PathBuf {
+		self.root.join(&self.slug)
+	}
+
 	/// Absolute path to the composited key face.
 	pub fn image_path(&self) -> PathBuf {
-		directory(&self.slug).join(&self.config.image)
+		self.dir().join(&self.config.image)
 	}
 
 	/// Absolute path to the image the key face was composited *from*, when one was kept.
@@ -67,15 +91,27 @@ impl CustomAction {
 		self.config
 			.icon
 			.as_ref()
-			.map(|icon| directory(&self.slug).join(icon))
+			.map(|icon| self.dir().join(icon))
 			.filter(|path| std::fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false))
 	}
 }
 
 pub const PICTURE: &str = "picture.png";
 
+fn new_id() -> String {
+	use std::time::{SystemTime, UNIX_EPOCH};
+	let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+	format!("ca-{nanos}")
+}
+
 pub fn customs_dir() -> PathBuf {
 	config_dir().join("customs")
+}
+
+/// Predefined entries ship with the app but live on disk in the same shape as the user's own, so
+/// they can be re-themed or replaced, and users can add their own.
+pub fn predefined_dir() -> PathBuf {
+	config_dir().join("predefined")
 }
 
 fn directory(slug: &str) -> PathBuf {
@@ -108,9 +144,88 @@ fn unique_slug(name: &str, except: Option<&str>) -> String {
 	candidate
 }
 
-/// Read every action in the library, skipping any directory whose config will not parse.
+/// Draw a simple arrow key face: a solid background with a white arrow.
+///
+/// Generated rather than shipped as a binary asset so the artwork stays editable - the files land
+/// in `predefined/` like any other action, and can be re-themed or replaced.
+fn arrow_picture(background: &str, pointing_right: bool) -> RgbaImage {
+	let mut canvas = RgbaImage::from_pixel(CANVAS, CANVAS, parse_colour(background));
+	let white = Rgba([255, 255, 255, 255]);
+
+	let mid = CANVAS as i32 / 2;
+	let shaft_half = (CANVAS as f32 * 0.045).round() as i32;
+	let (shaft_start, shaft_end) = ((CANVAS as f32 * 0.28) as i32, (CANVAS as f32 * 0.66) as i32);
+	let head = (CANVAS as f32 * 0.20) as i32;
+
+	for y in (mid - shaft_half)..=(mid + shaft_half) {
+		for x in shaft_start..=shaft_end {
+			let x = if pointing_right { x } else { CANVAS as i32 - x };
+			blend(&mut canvas, x, y, white, 1.0);
+		}
+	}
+
+	// Triangular head: each step in from the tip widens the arm by one pixel.
+	let tip = if pointing_right { (CANVAS as f32 * 0.76) as i32 } else { CANVAS as i32 - (CANVAS as f32 * 0.76) as i32 };
+	for step in 0..head {
+		let x = if pointing_right { tip - step } else { tip + step };
+		for y in (mid - step)..=(mid + step) {
+			blend(&mut canvas, x, y, white, 1.0);
+		}
+	}
+
+	canvas
+}
+
+/// Create the shipped page commands on first run, if they are not already there.
+fn ensure_predefined() {
+	let root = predefined_dir();
+	for (slug, name, uuid, colour, pointing_right) in [
+		("page-left", "Page Left", crate::shared::PAGE_LEFT_UUID, "#3B82F6", false),
+		("page-right", "Page Right", crate::shared::PAGE_RIGHT_UUID, "#22C55E", true),
+	] {
+		let directory = root.join(slug);
+		if directory.join("config.json").exists() {
+			continue;
+		}
+		if let Err(error) = std::fs::create_dir_all(&directory) {
+			log::error!("Failed to create {}: {error}", directory.display());
+			continue;
+		}
+
+		if let Err(error) = write_picture(arrow_picture(colour, pointing_right), &directory.join(PICTURE)) {
+			log::error!("Failed to draw {name} artwork: {error}");
+			continue;
+		}
+
+		let config = CustomActionConfig {
+			id: new_id(),
+			name: name.to_owned(),
+			command: String::new(),
+			action: Some(uuid.to_owned()),
+			image: PICTURE.to_owned(),
+			icon: None,
+			background: Some(colour.to_owned()),
+		};
+		if let Err(error) = write_config(&directory, &config) {
+			log::error!("Failed to write {name} config: {error}");
+		}
+	}
+}
+
+/// The user's own action library.
 pub fn load() -> Vec<CustomAction> {
-	let Ok(entries) = std::fs::read_dir(customs_dir()) else {
+	load_from(customs_dir())
+}
+
+/// The shipped page commands, generating them on first run.
+pub fn load_predefined() -> Vec<CustomAction> {
+	ensure_predefined();
+	load_from(predefined_dir())
+}
+
+/// Read every action in a library, skipping any directory whose config will not parse.
+fn load_from(root: PathBuf) -> Vec<CustomAction> {
+	let Ok(entries) = std::fs::read_dir(&root) else {
 		return Vec::new();
 	};
 
@@ -119,8 +234,18 @@ pub fn load() -> Vec<CustomAction> {
 		.filter(|entry| entry.path().is_dir())
 		.filter_map(|entry| {
 			let slug = entry.file_name().to_string_lossy().into_owned();
-			let config: CustomActionConfig = serde_json::from_slice(&std::fs::read(entry.path().join("config.json")).ok()?).ok()?;
-			Some(CustomAction { slug, config })
+			let mut config: CustomActionConfig = serde_json::from_slice(&std::fs::read(entry.path().join("config.json")).ok()?).ok()?;
+
+			// Actions written before ids existed get one now, so they can be linked from here on.
+			if config.id.is_empty() {
+				config.id = new_id();
+				let _ = write_config(&root.join(&slug), &config);
+			}
+			Some(CustomAction {
+				slug,
+				root: root.clone(),
+				config,
+			})
 		})
 		.collect();
 
@@ -287,10 +412,14 @@ fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
 	Ok(source_name)
 }
 
-fn save_config(slug: &str, config: &CustomActionConfig) -> Result<()> {
-	let mut store = Store::new("config", &directory(slug), CustomActionConfig::default())?;
+fn write_config(directory: &Path, config: &CustomActionConfig) -> Result<()> {
+	let mut store = Store::new("config", directory, CustomActionConfig::default())?;
 	store.value = config.clone();
 	store.save()
+}
+
+fn save_config(slug: &str, config: &CustomActionConfig) -> Result<()> {
+	write_config(&directory(slug), config)
 }
 
 /// Create a custom action, giving it its own directory.
@@ -299,15 +428,21 @@ pub fn create(name: String, command: String, spec: &ImageSpec) -> Result<CustomA
 	let icon = compose(&directory(&slug), spec)?;
 
 	let config = CustomActionConfig {
+		id: new_id(),
 		name,
 		command,
+		action: None,
 		image: PICTURE.to_owned(),
 		icon,
 		background: spec.background.clone(),
 	};
 
 	save_config(&slug, &config)?;
-	Ok(CustomAction { slug, config })
+	Ok(CustomAction {
+		slug,
+		root: customs_dir(),
+		config,
+	})
 }
 
 /// Update an existing action, moving its directory if the name changed.
@@ -352,7 +487,11 @@ pub fn update(slug: &str, name: String, command: String, spec: &ImageSpec) -> Re
 	}
 
 	save_config(&new_slug, &config)?;
-	Ok(CustomAction { slug: new_slug, config })
+	Ok(CustomAction {
+		slug: new_slug,
+		root: customs_dir(),
+		config,
+	})
 }
 
 /// Remove an action and everything it owns.

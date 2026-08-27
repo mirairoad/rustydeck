@@ -6,6 +6,7 @@ mod elgato;
 mod encoder_layouts;
 mod events;
 mod frontend_events;
+mod pages;
 mod plugins;
 mod power_events;
 mod shared;

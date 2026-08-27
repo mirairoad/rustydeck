@@ -6,16 +6,16 @@ use crate::custom_actions::{self, CustomAction, ImageSpec};
 use crate::device_render::{render_state, resolve_image_path};
 use crate::events::frontend;
 use crate::frontend_events::{self, FrontendEvent};
-use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, Profile};
+use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, PAGE_LEFT_UUID, PAGE_RIGHT_UUID, Profile};
 
 use std::rc::Rc;
 
 use gpui::{
     App, Context, Div, Entity, IntoElement, ParentElement, Render, RenderOnce, SharedString, Stateful, Styled, WeakEntity, Window, div, img,
-    prelude::*, px, rgb,
+    deferred, prelude::*, px, rgb,
 };
 use gpui_component::{
-    ActiveTheme, Collapsible, IconName, StyledExt,
+    ActiveTheme, Collapsible, Disableable, IconName, StyledExt,
     button::Button,
     color_picker::{ColorPicker, ColorPickerState},
     dialog::DialogButtonProps,
@@ -35,6 +35,12 @@ const GAP: f32 = 8.0;
 /// Below this window width the palette collapses to an icon-only rail. Derived from the viewport
 /// each frame rather than stored, so resizing is live.
 const SIDEBAR_BREAKPOINT: f32 = 900.0;
+
+/// Width of a custom action's `...` menu, which opens to the right of the sidebar.
+const ROW_MENU_WIDTH: f32 = 120.0;
+
+/// Diameter of the dial knobs drawn beneath the touch strip.
+const DIAL_SIZE: f32 = 44.0;
 
 const KEYPAD_CONTROLLER: &str = "Keypad";
 const ENCODER_CONTROLLER: &str = "Encoder";
@@ -116,10 +122,17 @@ pub struct RustyDeckShell {
     categories: Vec<(String, Category)>,
     /// The user's own action library.
     custom: Vec<CustomAction>,
+    /// Shipped entries, living on disk in the same shape so they can be re-themed or replaced.
+    predefined: Vec<CustomAction>,
     device_picker_open: bool,
+    /// Pages on the current device, in display order, and which one is showing.
+    pages: Vec<String>,
+    current_page: String,
     form: Entity<ActionForm>,
     /// Id of the custom action whose `...` menu is open.
     row_menu_open: Option<String>,
+    /// Slot whose right-click menu is open.
+    slot_menu_open: Option<SlotContext>,
 }
 
 impl RustyDeckShell {
@@ -131,6 +144,8 @@ impl RustyDeckShell {
             while let Ok(event) = events.recv().await {
                 match event {
                     FrontendEvent::Devices(_) | FrontendEvent::PluginReloaded(_) => refresh_catalogue(&this, cx).await,
+                    // A page changed on the deck - follow it in the window.
+                    FrontendEvent::SwitchProfile { .. } => reload_profile(&this, cx).await,
                     _ => {}
                 }
             }
@@ -143,7 +158,10 @@ impl RustyDeckShell {
             devices: Vec::new(),
             categories: Vec::new(),
             custom: custom_actions::load(),
+            predefined: custom_actions::load_predefined(),
             device_picker_open: false,
+            pages: Vec::new(),
+            current_page: String::new(),
             form: cx.new(|cx| ActionForm {
                 name: cx.new(|cx| InputState::new(window, cx).placeholder("Lock screen")),
                 command: cx.new(|cx| InputState::new(window, cx).placeholder("loginctl lock-session")),
@@ -154,7 +172,61 @@ impl RustyDeckShell {
                 editing: None,
             }),
             row_menu_open: None,
+            slot_menu_open: None,
         }
+    }
+
+    /// Remove the action occupying a slot, clearing it on screen and on the hardware.
+    fn delete_slot(&mut self, context: SlotContext, cx: &mut Context<Self>) {
+        self.slot_menu_open = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let context = crate::shared::ActionContext::from_context(context, 0);
+            if let Err(error) = crate::bridge(frontend::instances::remove_instance(context)).await {
+                log::error!("Failed to remove action: {error}");
+                return;
+            }
+            reload_profile(&this, cx).await;
+        })
+        .detach();
+    }
+
+    /// Step, add or remove a page, then re-read the profile so the window and the hardware both
+    /// follow. Pages are profiles, so this is the same reload path every other mutation uses.
+    fn page_action(&mut self, action: PageAction, cx: &mut Context<Self>) {
+        let Some(device) = self.device.as_ref().map(|device| device.id.clone()) else {
+            return;
+        };
+        let current = self.current_page.clone();
+
+        cx.spawn(async move |this, cx| {
+            let result = crate::bridge(async move {
+                match action {
+                    PageAction::Step(delta) => crate::pages::step(&device, delta).await,
+                    PageAction::Add => crate::pages::add(&device).await.map(|_| ()),
+                    PageAction::Remove => crate::pages::remove(&device, &current).await,
+                }
+            })
+            .await;
+
+            if let Err(error) = result {
+                log::error!("Page operation failed: {error}");
+                return;
+            }
+            reload_profile(&this, cx).await;
+        })
+        .detach();
+    }
+
+    /// Placeholder for per-dial configuration.
+    fn open_dial_dialog(&mut self, dial: u8, window: &mut Window, cx: &mut Context<Self>) {
+        let title = SharedString::from(format!("Dial {}", dial + 1));
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            dialog
+                .title(title.clone())
+                .child(div().p_4().text_sm().child("Dial settings will live here."))
+        });
     }
 
     /// Run a custom action's command directly, without going through the deck.
@@ -345,25 +417,36 @@ impl RustyDeckShell {
     /// Place a custom action on a slot: create the Run Command instance that backs it, then write
     /// its command and image onto that instance.
     fn handle_create_custom(&mut self, action: CustomAction, destination: SlotContext, cx: &mut Context<Self>) {
-        let Some(run_command) = self
+        // A predefined entry names the built-in action it places; a user's own runs a shell
+        // command through Run Command.
+        let wanted = action.action_uuid().unwrap_or(RUN_COMMAND_UUID).to_owned();
+        let Some(base_action) = self
             .categories
             .iter()
             .flat_map(|(_, category)| category.actions.iter())
-            .find(|candidate| candidate.uuid == RUN_COMMAND_UUID)
+            .find(|candidate| candidate.uuid == wanted)
             .cloned()
         else {
-            log::error!("Cannot place custom action: the {RUN_COMMAND_UUID} action is not registered");
+            log::error!("Cannot place action: {wanted} is not registered");
             return;
         };
+        let is_command = action.action_uuid().is_none();
 
         cx.spawn(async move |this, cx| {
-            let Ok(Some(instance)) = crate::bridge(frontend::instances::create_instance(run_command, destination)).await else {
+            let Ok(Some(instance)) = crate::bridge(frontend::instances::create_instance(base_action, destination)).await else {
                 return;
             };
             let context = instance.context.clone();
 
             // `settings.down` is the key `RunCommandSettings` reads for the key-press command.
-            let payload = serde_json::json!({ "down": action.command() });
+            // `rustydeck_custom` links the key back to the library entry it came from, so editing
+            // that entry later updates this key rather than leaving a stale copy behind.
+            // `RunCommandSettings` is `#[serde(default)]` and ignores keys it does not know.
+            let payload = if is_command {
+                serde_json::json!({ "down": action.command(), "rustydeck_custom": action.id() })
+            } else {
+                serde_json::json!({ "rustydeck_custom": action.id() })
+            };
             let event = crate::events::inbound::ContextAndPayloadEvent {
                 context: context.clone(),
                 payload,
@@ -414,6 +497,8 @@ impl RustyDeckShell {
     /// Create a new instance from a palette entry dropped onto a slot.
     fn handle_create(&mut self, action: Action, destination: SlotContext, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
+            // `create_instance` returns `None` for an occupied slot or an unsupported controller,
+            // so an invalid drop is already a safe no-op.
             // `create_instance` returns `None` for an occupied slot or an unsupported controller,
             // so an invalid drop is already a safe no-op.
             let Ok(Some(_)) = crate::bridge(frontend::instances::create_instance(action, destination)).await else {
@@ -476,7 +561,9 @@ impl RustyDeckShell {
 
         if let Some(instance) = &slot {
             let state = instance.states.get(instance.current_state as usize);
-            let image_path = state.map(|state| state.image.clone());
+            // Actions without artwork (the page commands, for now) carry an empty path, which
+            // would resolve to the config directory and fail to load.
+            let image_path = state.map(|state| state.image.clone()).filter(|path| !path.is_empty());
 
             if let Some(path) = image_path.clone() {
                 // Match what the hardware shows. `device_render` stretches the artwork to the
@@ -511,6 +598,55 @@ impl RustyDeckShell {
                     cx.new(|_| DragPreview { image })
                 },
             );
+        }
+
+        if slot.is_some() {
+            let menu_context = context.clone();
+            cell = cell.on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.slot_menu_open = Some(menu_context.clone());
+                    cx.notify();
+                }),
+            );
+
+            if self.slot_menu_open.as_ref() == Some(&context) {
+                let delete_context = context.clone();
+                cell = cell.relative().child(
+                    // Same layering as the sidebar row menu: painted last so nothing covers it,
+                    // and occluding so the click cannot fall through to the slot beneath.
+                    deferred(
+                        v_flex()
+                            .occlude()
+                            .absolute()
+                            .top_full()
+                            .left_0()
+                            .w(px(ROW_MENU_WIDTH))
+                            .p_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().background)
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .id("slot-delete")
+                                    .w_full()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .text_sm()
+                                    .text_color(cx.theme().danger)
+                                    .hover(|style| style.bg(cx.theme().accent))
+                                    .child("Delete")
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        this.delete_slot(delete_context.clone(), cx);
+                                    })),
+                            ),
+                    )
+                    .with_priority(1),
+                );
+            }
         }
 
         // Two drop payloads land on the same cell: an existing instance being moved/swapped, and a
@@ -589,12 +725,99 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
         return;
     };
 
+    // Bring any key created from a custom action back in line with the library, in case that
+    // action was edited since. Only the visible page needs this: the deck shows one page at a
+    // time, and every page switch comes back through here. Re-read afterwards, or the copy in
+    // hand - and so the window and the images pushed to the deck - would still be the stale one.
+    let profile = if sync_custom_instances(&device, &profile).await {
+        match crate::bridge(frontend::profiles::get_selected_profile(device.id.clone())).await {
+            Ok(refreshed) => refreshed,
+            Err(_) => profile,
+        }
+    } else {
+        profile
+    };
+
+    let device_id = device.id.clone();
+    let device_id_for_current = device.id.clone();
+    let pages = crate::bridge(async move { crate::pages::list(&device_id) }).await;
+    let current_page = crate::bridge(async move { crate::pages::current(&device_id_for_current).await }).await;
+
     let _ = this.update(cx, |this, cx| {
         this.profile = Some(profile.clone());
+        this.pages = pages;
+        this.current_page = current_page;
         cx.notify();
     });
 
     push_device_images(device, profile).await;
+}
+
+/// Re-apply the current definition of any custom action that a slot was created from.
+///
+/// Instances store a copy of the command and artwork so the plugin and the device renderer can
+/// work without consulting us; `rustydeck_custom` is what lets that copy be refreshed instead of
+/// silently drifting from the library.
+/// Returns whether anything was changed, so the caller knows to re-read the profile.
+async fn sync_custom_instances(device: &DeviceInfo, profile: &Profile) -> bool {
+    let mut library = custom_actions::load();
+    library.extend(custom_actions::load_predefined());
+    if library.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+
+    for controller in [KEYPAD_CONTROLLER, ENCODER_CONTROLLER, INFOBAR_CONTROLLER] {
+        for (position, slot) in slots(profile, controller).iter().enumerate() {
+            let Some(instance) = slot else { continue };
+            let Some(id) = instance.settings.get("rustydeck_custom").and_then(|id| id.as_str()) else {
+                continue;
+            };
+            let Some(action) = library.iter().find(|action| action.id() == id) else {
+                continue;
+            };
+
+            let image = action.image_path().to_string_lossy().into_owned();
+            // Predefined entries place a built-in action and have no command to keep in step.
+            let command_matches =
+                action.action_uuid().is_some() || instance.settings.get("down").and_then(|c| c.as_str()) == Some(action.command());
+            let image_matches = instance.states.first().map(|state| state.image.as_str()) == Some(image.as_str());
+            if command_matches && image_matches {
+                continue;
+            }
+
+            let context = crate::shared::ActionContext::from_context(
+                SlotContext {
+                    device: device.id.clone(),
+                    profile: profile.id.clone(),
+                    controller: controller.to_owned(),
+                    position: position as u8,
+                },
+                0,
+            );
+
+            if !command_matches {
+                let event = crate::events::inbound::ContextAndPayloadEvent {
+                    context: context.clone(),
+                    payload: serde_json::json!({ "down": action.command(), "rustydeck_custom": id }),
+                };
+                if let Err(error) = crate::bridge(crate::events::inbound::settings::set_settings(event, true)).await {
+                    log::error!("Failed to re-sync custom action command: {error}");
+                }
+            }
+
+            if !image_matches && let Some(mut state) = instance.states.first().cloned() {
+                state.image = image;
+                if let Err(error) = crate::bridge(frontend::instances::set_state(context, 0, state)).await {
+                    log::error!("Failed to re-sync custom action image: {error}");
+                }
+            }
+
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 /// Refresh the device list and action palette, auto-selecting a device if none is chosen yet.
@@ -647,6 +870,14 @@ fn hsla_to_hex(colour: gpui::Hsla) -> String {
     format!("#{:02X}{:02X}{:02X}", channel(rgba.r), channel(rgba.g), channel(rgba.b))
 }
 
+#[derive(Clone, Copy)]
+enum PageAction {
+    /// Move by this many pages, wrapping.
+    Step(i32),
+    Add,
+    Remove,
+}
+
 /// A labelled form field in the create dialog.
 fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
     v_flex().gap_1().child(div().text_sm().child(label)).child(control)
@@ -694,6 +925,7 @@ enum PaletteRow {
         on_delete: Rc<dyn Fn(&mut Window, &mut App)>,
     },
     Plugin { action: Action, collapsed: bool },
+    Predefined { action: CustomAction, collapsed: bool },
 }
 
 /// One entry in a custom action's `...` menu.
@@ -714,14 +946,20 @@ fn menu_entry(id: &'static str, label: &'static str, on_click: Rc<dyn Fn(&mut Wi
 impl Collapsible for PaletteRow {
     fn collapsed(mut self, value: bool) -> Self {
         match &mut self {
-            PaletteRow::Create { collapsed, .. } | PaletteRow::Custom { collapsed, .. } | PaletteRow::Plugin { collapsed, .. } => *collapsed = value,
+            PaletteRow::Create { collapsed, .. }
+            | PaletteRow::Custom { collapsed, .. }
+            | PaletteRow::Plugin { collapsed, .. }
+            | PaletteRow::Predefined { collapsed, .. } => *collapsed = value,
         }
         self
     }
 
     fn is_collapsed(&self) -> bool {
         match self {
-            PaletteRow::Create { collapsed, .. } | PaletteRow::Custom { collapsed, .. } | PaletteRow::Plugin { collapsed, .. } => *collapsed,
+            PaletteRow::Create { collapsed, .. }
+            | PaletteRow::Custom { collapsed, .. }
+            | PaletteRow::Plugin { collapsed, .. }
+            | PaletteRow::Predefined { collapsed, .. } => *collapsed,
         }
     }
 }
@@ -759,9 +997,18 @@ impl RenderOnce for PaletteRow {
                 on_delete,
             } => {
                 let id = action.slug.clone();
+                let background = action.config.background.as_deref().and_then(hex_to_hsla);
                 palette_row(SharedString::from(action.slug.clone()), cx)
                     .relative()
-                    .child(img(action.image_path()).size(px(20.0)).flex_none())
+                    .child(
+                        div()
+                            .size(px(20.0))
+                            .flex_none()
+                            .rounded_sm()
+                            .overflow_hidden()
+                            .when_some(background, |tile, colour| tile.bg(colour))
+                            .child(img(action.image_path()).size_full()),
+                    )
                     .when(!collapsed, |row| {
                         row.child(div().flex_1().text_sm().child(SharedString::from(action.name().to_owned())))
                             .child(
@@ -777,19 +1024,29 @@ impl RenderOnce for PaletteRow {
                     })
                     .when(menu_open, |row| {
                         row.child(
-                            v_flex()
-                                .absolute()
-                                .top(px(28.0))
-                                .right_0()
-                                .w(px(120.0))
-                                .p_1()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().background)
-                                .child(menu_entry("execute", "Execute", on_execute, cx))
-                                .child(menu_entry("edit", "Edit", on_edit, cx))
-                                .child(menu_entry("delete", "Delete", on_delete, cx)),
+                            // `deferred` paints the menu after everything else, so later sidebar
+                            // rows cannot cover it - and since GPUI hit-tests in paint order, this
+                            // is also what stops clicks landing on the row underneath. `occlude`
+                            // blocks the mouse from reaching whatever is behind it.
+                            deferred(
+                                v_flex()
+                                    .occlude()
+                                    .absolute()
+                                    .top_0()
+                                    // Opens to the right of the sidebar rather than over it.
+                                    .right(px(-(ROW_MENU_WIDTH + GAP)))
+                                    .w(px(ROW_MENU_WIDTH))
+                                    .p_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().background)
+                                    .shadow_lg()
+                                    .child(menu_entry("execute", "Execute", on_execute, cx))
+                                    .child(menu_entry("edit", "Edit", on_edit, cx))
+                                    .child(menu_entry("delete", "Delete", on_delete, cx)),
+                            )
+                            .with_priority(1),
                         )
                     })
                     .on_drag(DraggedCustomAction { action }, |dragged, _offset, _window, cx| {
@@ -799,11 +1056,36 @@ impl RenderOnce for PaletteRow {
                     .into_any_element()
             }
 
+            PaletteRow::Predefined { action, collapsed } => {
+                let background = action.config.background.as_deref().and_then(hex_to_hsla);
+                palette_row(SharedString::from(action.slug.clone()), cx)
+                    .child(
+                        div()
+                            .size(px(20.0))
+                            .flex_none()
+                            .rounded_sm()
+                            .overflow_hidden()
+                            .when_some(background, |tile, colour| tile.bg(colour))
+                            .child(img(action.image_path()).size_full()),
+                    )
+                    .when(!collapsed, |row| row.child(div().text_sm().child(SharedString::from(action.name().to_owned()))))
+                    .on_drag(DraggedCustomAction { action }, |dragged, _offset, _window, cx| {
+                        let image = Some(dragged.action.image_path().to_string_lossy().into_owned());
+                        cx.new(|_| DragPreview { image })
+                    })
+                    .into_any_element()
+            }
+
             PaletteRow::Plugin { action, collapsed } => palette_row(SharedString::from(action.uuid.clone()), cx)
-                .child(img(resolve_image_path(&action.icon)).size(px(20.0)).flex_none())
+                .child(match action.uuid.as_str() {
+                    // Placeholders until these get real artwork.
+                    PAGE_LEFT_UUID => div().size(px(20.0)).flex_none().rounded_sm().bg(rgb(0x3B82F6)).into_any_element(),
+                    PAGE_RIGHT_UUID => div().size(px(20.0)).flex_none().rounded_sm().bg(rgb(0x22C55E)).into_any_element(),
+                    _ => img(resolve_image_path(&action.icon)).size(px(20.0)).flex_none().into_any_element(),
+                })
                 .when(!collapsed, |row| row.child(div().text_sm().child(SharedString::from(action.name.clone()))))
                 .on_drag(DraggedAction { action }, |dragged, _offset, _window, cx| {
-                    let image = Some(dragged.action.icon.clone());
+                    let image = Some(dragged.action.icon.clone()).filter(|icon| !icon.is_empty());
                     cx.new(|_| DragPreview { image })
                 })
                 .into_any_element(),
@@ -818,7 +1100,7 @@ struct DragPreview {
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let mut preview = div().size(px(CELL_SIZE)).bg(rgb(0x45475a)).rounded_md();
-        if let Some(path) = self.image.clone() {
+        if let Some(path) = self.image.clone().filter(|path| !path.is_empty()) {
             preview = preview.child(img(resolve_image_path(&path)).size_full());
         }
         preview
@@ -934,20 +1216,58 @@ impl RustyDeckShell {
             }
         }));
 
-        // Every plugin action, flattened - the sections are what carry meaning here, not the
-        // per-plugin categories.
         let predefined_rows: Vec<PaletteRow> = self
-            .categories
+            .predefined
             .iter()
-            .flat_map(|(_, category)| category.actions.iter())
             .cloned()
-            .map(|action| PaletteRow::Plugin { action, collapsed })
+            .map(|action| PaletteRow::Predefined { action, collapsed })
             .collect();
 
         Sidebar::left().collapsed(collapsed).children(vec![
             SidebarGroup::new("Custom actions").children(custom_rows),
             SidebarGroup::new("Predefined actions").children(predefined_rows),
         ])
+    }
+
+    /// Page controls, sat in the bottom-right of the device view.
+    fn render_pager(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let total = self.pages.len().max(1);
+        let index = self.pages.iter().position(|page| *page == self.current_page).unwrap_or(0) + 1;
+        let only_page = total < 2;
+
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                Button::new("page-prev")
+                    .icon(IconName::ChevronLeft)
+                    .disabled(only_page)
+                    .on_click(cx.listener(|this, _event, _window, cx| this.page_action(PageAction::Step(-1), cx))),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(SharedString::from(format!("{index} / {total}"))),
+            )
+            .child(
+                Button::new("page-next")
+                    .icon(IconName::ChevronRight)
+                    .disabled(only_page)
+                    .on_click(cx.listener(|this, _event, _window, cx| this.page_action(PageAction::Step(1), cx))),
+            )
+            .child(
+                Button::new("page-add")
+                    .icon(IconName::Plus)
+                    .on_click(cx.listener(|this, _event, _window, cx| this.page_action(PageAction::Add, cx))),
+            )
+            .child(
+                Button::new("page-remove")
+                    .icon(IconName::Delete)
+                    .disabled(only_page)
+                    .on_click(cx.listener(|this, _event, _window, cx| this.page_action(PageAction::Remove, cx))),
+            )
     }
 
     /// The device's slots - keypad, touch strip, touchpoints and infobar.
@@ -992,6 +1312,31 @@ impl RustyDeckShell {
             })));
         }
 
+        // The physical dials. The strip above shows what each dial *displays*; these are the knobs
+        // themselves, which will get their own configuration.
+        if device.encoders > 0 {
+            let encoders = device.encoders;
+            let segment_width = (keypad_width - (encoders.saturating_sub(1)) as f32 * GAP) / encoders as f32;
+
+            shell = shell.child(div().flex().flex_row().gap(px(GAP)).mt(px(GAP * 2.0)).children((0..encoders).map(|dial| {
+                div()
+                    .w(px(segment_width))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id(("dial", dial as usize))
+                            .size(px(DIAL_SIZE))
+                            .rounded_full()
+                            .bg(cx.theme().secondary)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .hover(|style| style.bg(cx.theme().accent))
+                            .on_click(cx.listener(move |this, _event, window, cx| this.open_dial_dialog(dial, window, cx))),
+                    )
+            })));
+        }
+
         if device.infobars > 0 {
             let infobar_height = keypad_width * INFOBAR_IMAGE.1 as f32 / INFOBAR_IMAGE.0 as f32;
             shell = shell.child(div().flex().flex_row().gap(px(GAP)).children((0..device.infobars).map(|position| {
@@ -999,7 +1344,7 @@ impl RustyDeckShell {
             })));
         }
 
-        shell.into_any_element()
+        shell.child(div().mt_4().child(self.render_pager(cx))).into_any_element()
     }
 }
 
@@ -1013,6 +1358,25 @@ impl Render for RustyDeckShell {
             .bg(cx.theme().background)
             .child(self.render_header(cx))
             .child(h_flex().flex_1().min_h_0().child(self.render_sidebar(collapsed, cx)).child(self.render_device(cx)))
+            // Click-outside-to-close for the row menu and the device picker. A plain last child
+            // covers the window and sits above everything normal, while the menus themselves are
+            // `deferred` and so still paint above this.
+            .when(self.row_menu_open.is_some() || self.device_picker_open || self.slot_menu_open.is_some(), |shell| {
+                shell.child(
+                    div()
+                        .id("dismiss-overlay")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.row_menu_open = None;
+                            this.slot_menu_open = None;
+                            this.device_picker_open = false;
+                            cx.notify();
+                        })),
+                )
+            })
             // `Root::render` only draws the app's own view - dialogs and notifications are
             // separate layers the hosting view is expected to place on top of itself.
             .children(gpui_component::Root::render_dialog_layer(window, cx))

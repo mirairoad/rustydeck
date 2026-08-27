@@ -35,6 +35,25 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 	KEY_DOWN_TARGETS.insert((device.to_owned(), key), context.clone());
 
 	let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
+
+	// Page stepping is handled here rather than by a plugin. Crucially the profile locks must be
+	// released first: switching a page re-acquires them, so stepping inline would deadlock.
+	let step = match instance.action.uuid.as_str() {
+		crate::shared::PAGE_LEFT_UUID => Some(-1),
+		crate::shared::PAGE_RIGHT_UUID => Some(1),
+		_ => None,
+	};
+	if let Some(delta) = step {
+		drop(locks);
+		let device = device.to_owned();
+		crate::spawn(async move {
+			if let Err(error) = crate::pages::step(&device, delta).await {
+				log::error!("Failed to change page: {error}");
+			}
+		});
+		return Ok(());
+	}
+
 	if instance.action.uuid == "opendeck.multiaction" {
 		let children = instance.children.clone().unwrap_or_default();
 		let delays: Vec<u64> = instance
@@ -150,6 +169,12 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
 
 	let slot = get_slot_mut(&context, &mut locks).await?;
 	let Some(instance) = slot else { return Ok(()) };
+
+	// The page actions were fully handled on key-down and have no plugin to notify; sending to the
+	// non-existent "rustydeck" plugin would just queue messages forever.
+	if matches!(instance.action.uuid.as_str(), crate::shared::PAGE_LEFT_UUID | crate::shared::PAGE_RIGHT_UUID) {
+		return Ok(());
+	}
 
 	if instance.action.uuid == "opendeck.toggleaction" {
 		let index = instance.current_state as usize;

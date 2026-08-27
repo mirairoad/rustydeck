@@ -70,6 +70,28 @@ struct DialPressEvent {
 	payload: DialPressPayload,
 }
 
+
+/// Page stepping for encoder slots.
+///
+/// Returns whether the instance was a page command and has been handled. As on the keypad, the
+/// profile locks must be released before stepping - switching a page re-acquires them.
+fn page_step_for(uuid: &str) -> Option<i32> {
+	match uuid {
+		crate::shared::PAGE_LEFT_UUID => Some(-1),
+		crate::shared::PAGE_RIGHT_UUID => Some(1),
+		_ => None,
+	}
+}
+
+fn spawn_page_step(device: &str, delta: i32) {
+	let device = device.to_owned();
+	crate::spawn(async move {
+		if let Err(error) = crate::pages::step(&device, delta).await {
+			log::error!("Failed to change page: {error}");
+		}
+	});
+}
+
 pub async fn dial_press(device: &str, event: &'static str, index: u8) -> Result<(), anyhow::Error> {
 	let mut locks = acquire_locks_mut().await;
 	let selected_profile = locks.device_stores.get_selected_profile(device)?;
@@ -81,6 +103,16 @@ pub async fn dial_press(device: &str, event: &'static str, index: u8) -> Result<
 		index: 0,
 	};
 	let Some(instance) = get_instance_mut(&context, &mut locks).await? else { return Ok(()) };
+
+	if let Some(delta) = page_step_for(&instance.action.uuid) {
+		drop(locks);
+		// Step once per press, on the way down.
+		if event == "dialDown" {
+			spawn_page_step(device, delta);
+		}
+		return Ok(());
+	}
+
 	let _ = crate::frontend::instances::key_moved(context.into(), event == "dialDown").await;
 
 	send_to_plugin(
@@ -130,6 +162,12 @@ pub async fn touch_tap(device: &str, index: u8, x: u16, y: u16, hold: bool) -> R
 		index: 0,
 	};
 	let Some(instance) = get_instance_mut(&context, &mut locks).await? else { return Ok(()) };
+
+	if let Some(delta) = page_step_for(&instance.action.uuid) {
+		drop(locks);
+		spawn_page_step(device, delta);
+		return Ok(());
+	}
 
 	send_to_plugin(
 		&instance.action.plugin,
