@@ -51,8 +51,12 @@ impl ProfileStores {
 			let actions = categories.values().flat_map(|v| v.actions.iter()).collect::<Vec<_>>();
 			let plugins_dir = config_dir().join("plugins");
 			let registered = crate::events::registered_plugins().await;
+			// Actions the app implements itself have no directory under `plugins/` to find, so
+			// without the first arm they fail the "is this plugin still installed?" test below and
+			// are pruned - silently deleting every page command and System dial action from every
+			// profile, and saving that over the file, each time a device reconnects.
 			let keep_instance = |instance: &ActionInstance| -> bool {
-				instance.action.plugin == "opendeck"
+				crate::shared::is_builtin_plugin(&instance.action.plugin)
 					|| (plugins_dir.join(&instance.action.plugin).exists() && (!registered.contains(&instance.action.plugin) || actions.iter().any(|v| v.uuid == instance.action.uuid)))
 			};
 			for slot in store.value.keys.iter_mut().chain(store.value.sliders.iter_mut()).chain(store.value.infobars.iter_mut()) {
@@ -189,9 +193,39 @@ impl ProfileStores {
 	}
 }
 
+/// What one physical dial does.
+///
+/// Dials are device-scoped rather than page-scoped: the knob is a fixed control, so it keeps doing
+/// the same thing whichever page is showing. The rectangle above it is the page-scoped half - it
+/// owns the artwork and the tap, and lives in the profile like any other slot.
+///
+/// Deliberately not an [`ActionInstance`]: a dial runs either a first-party action or the user's
+/// own shell commands, both of which the app executes itself, so none of the plugin instance
+/// machinery (contexts, `willAppear`, settings round-trips) applies.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DialConfig {
+	/// A first-party action implemented in `system_actions`, named by its UUID.
+	System { uuid: String },
+	/// Shell commands run directly by the app: anticlockwise, clockwise, and a press.
+	Custom { left: String, right: String, centre: String },
+}
+
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct DeviceConfig {
 	pub selected_profile: String,
+	/// One entry per encoder, `None` where the dial is unconfigured.
+	pub dials: Vec<Option<DialConfig>>,
+}
+
+impl Default for DeviceConfig {
+	fn default() -> Self {
+		Self {
+			selected_profile: "Default".to_owned(),
+			dials: Vec::new(),
+		}
+	}
 }
 
 impl super::NotProfile for DeviceConfig {}
@@ -203,9 +237,7 @@ pub struct DeviceStores {
 impl DeviceStores {
 	pub fn get_selected_profile(&mut self, device: &str) -> Result<String, anyhow::Error> {
 		if !self.stores.contains_key(device) {
-			let default = DeviceConfig {
-				selected_profile: "Default".to_owned(),
-			};
+			let default = DeviceConfig::default();
 
 			let store = Store::new(device, &config_dir().join("profiles"), default).context(format!("Failed to create store for device config {}", device))?;
 			store.save()?;
@@ -218,13 +250,91 @@ impl DeviceStores {
 		if all.contains(from_store) { Ok(from_store.clone()) } else { Ok(all.first().unwrap().clone()) }
 	}
 
+	/// Ensure the device's store exists and its dial array is the right length, returning it.
+	fn dials_mut(&mut self, device: &str, encoders: usize) -> Result<&mut Store<DeviceConfig>, anyhow::Error> {
+		if !self.stores.contains_key(device) {
+			let store = Store::new(device, &config_dir().join("profiles"), DeviceConfig::default())
+				.context(format!("Failed to create store for device config {device}"))?;
+			self.stores.insert(device.to_owned(), store);
+		}
+
+		let store = self.stores.get_mut(device).unwrap();
+		if store.value.dials.len() != encoders {
+			store.value.dials.resize_with(encoders, || None);
+		}
+		Ok(store)
+	}
+
+	/// What every dial on this device is set to.
+	pub fn get_dials(&mut self, device: &str, encoders: usize) -> Result<Vec<Option<DialConfig>>, anyhow::Error> {
+		Ok(self.dials_mut(device, encoders)?.value.dials.clone())
+	}
+
+	/// What one dial is set to, or `None` if it is unconfigured or out of range.
+	pub fn get_dial(&mut self, device: &str, encoders: usize, index: u8) -> Option<DialConfig> {
+		self.dials_mut(device, encoders).ok()?.value.dials.get(index as usize).cloned().flatten()
+	}
+
+	pub fn set_dial(&mut self, device: &str, encoders: usize, index: u8, config: Option<DialConfig>) -> Result<(), anyhow::Error> {
+		let store = self.dials_mut(device, encoders)?;
+		let Some(slot) = store.value.dials.get_mut(index as usize) else {
+			return Err(anyhow!("dial {index} is out of range for device {device}"));
+		};
+		*slot = config;
+		store.save()
+	}
+
+	/// Copy the rotate and press commands off a page's encoder slots onto the device's dials, once.
+	///
+	/// Dials used to live in the profile alongside the rectangle above them, so an existing setup
+	/// has its commands there. This lifts them to where dials now live, and deliberately changes
+	/// nothing in the profile: the slot keeps its artwork and its tap, and its now-unread `down`
+	/// and `rotate_*` keys are left alone rather than rewritten.
+	///
+	/// Only runs while every dial is still unconfigured, so it cannot overwrite a real setup.
+	pub fn seed_dials(&mut self, device: &str, encoders: usize, sliders: &[Option<ActionInstance>]) -> Result<(), anyhow::Error> {
+		let store = self.dials_mut(device, encoders)?;
+		if store.value.dials.iter().any(|dial| dial.is_some()) {
+			return Ok(());
+		}
+
+		let command = |instance: &ActionInstance, key: &str| {
+			instance.settings.get(key).and_then(|value| value.as_str()).unwrap_or_default().to_owned()
+		};
+
+		let mut seeded = false;
+		for (index, slot) in sliders.iter().enumerate().take(encoders) {
+			let Some(instance) = slot else { continue };
+
+			let dial = if crate::system_actions::is_system_action(&instance.action.uuid) {
+				DialConfig::System {
+					uuid: instance.action.uuid.clone(),
+				}
+			} else {
+				let (left, right, centre) = (command(instance, "rotate_left"), command(instance, "rotate_right"), command(instance, "down"));
+				if left.is_empty() && right.is_empty() && centre.is_empty() {
+					continue;
+				}
+				DialConfig::Custom { left, right, centre }
+			};
+
+			store.value.dials[index] = Some(dial);
+			seeded = true;
+		}
+
+		if seeded { store.save() } else { Ok(()) }
+	}
+
 	pub fn set_selected_profile(&mut self, device: &str, id: String) -> Result<(), anyhow::Error> {
 		if self.stores.contains_key(device) {
 			let store = self.stores.get_mut(device).unwrap();
 			store.value.selected_profile = id;
 			store.save()?;
 		} else {
-			let default = DeviceConfig { selected_profile: id };
+			let default = DeviceConfig {
+				selected_profile: id,
+				..Default::default()
+			};
 
 			let store = Store::new(device, &config_dir().join("profiles"), default).context(format!("Failed to create store for device config {}", device))?;
 			store.save()?;

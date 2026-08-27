@@ -24,6 +24,9 @@ pub struct RunCommandSettings {
 	down: Option<String>,
 	up: Option<String>,
 	rotate: Option<String>,
+	/// Runs on a tap of the touch strip. Separate from `down` so a dial press and a strip tap are
+	/// distinct gestures rather than the same one.
+	touch: Option<String>,
 	file: Option<String>,
 	show: bool,
 }
@@ -165,7 +168,7 @@ impl Action for RunCommandAction {
 		self.key_up(instance, settings).await
 	}
 
-	/// Tapping the touch strip runs the same command as a press.
+	/// Tapping the touch strip runs its own command.
 	///
 	/// Needs openaction >= 2.7: 2.6 had no `touchTap` event at all, so taps arrived as an unknown
 	/// event and were dropped with a warning.
@@ -176,7 +179,14 @@ impl Action for RunCommandAction {
 		_position: (u16, u16),
 		_hold: bool,
 	) -> OpenActionResult<()> {
-		self.key_down(instance, settings).await
+		let instance_id = instance.instance_id.clone();
+		let settings = settings.clone();
+		tokio::spawn(async move {
+			if let Err(error) = run_command(instance_id, &settings, &settings.touch, None).await {
+				log::warn!("Failed to run command: {error}");
+			}
+		});
+		Ok(())
 	}
 
 	async fn dial_rotate(

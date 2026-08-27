@@ -35,6 +35,8 @@ pub struct CustomActionConfig {
 	/// For predefined entries: the UUID of the action to instantiate instead of Run Command.
 	/// When set, `command` is unused.
 	pub action: Option<String>,
+	/// Which sidebar section this belongs to. `None` means the default predefined group.
+	pub category: Option<String>,
 	/// The composited key face, relative to the action's own directory.
 	pub image: String,
 	/// The icon it was composited from, if any (PNG/JPEG/SVG), relative to the directory.
@@ -64,6 +66,10 @@ impl CustomAction {
 		&self.config.command
 	}
 
+	pub fn category(&self) -> &str {
+		self.config.category.as_deref().unwrap_or("Predefined actions")
+	}
+
 	pub fn id(&self) -> &str {
 		&self.config.id
 	}
@@ -82,6 +88,15 @@ impl CustomAction {
 		self.dir().join(&self.config.image)
 	}
 
+	/// Absolute path to the face composed for the touch strip's rectangle.
+	///
+	/// Actions written before strip artwork existed have only the square picture, so fall back to
+	/// it - stretched as it was before, rather than a blank rectangle.
+	pub fn strip_path(&self) -> PathBuf {
+		let strip = self.dir().join(STRIP);
+		if strip.exists() { strip } else { self.image_path() }
+	}
+
 	/// Absolute path to the image the key face was composited *from*, when one was kept.
 	///
 	/// Editing must preview against this rather than [`Self::image_path`]: the composited picture
@@ -97,6 +112,13 @@ impl CustomAction {
 }
 
 pub const PICTURE: &str = "picture.png";
+
+/// The same artwork composed for the touch strip's rectangle rather than a square key.
+pub const STRIP: &str = "strip.png";
+
+/// Composed at twice the key canvas's width so it downsamples cleanly to the 200x100 region the
+/// hardware actually writes.
+const STRIP_SIZE: (u32, u32) = (CANVAS * 2, CANVAS);
 
 fn new_id() -> String {
 	use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,32 +166,77 @@ fn unique_slug(name: &str, except: Option<&str>) -> String {
 	candidate
 }
 
-/// Draw a simple arrow key face: a solid background with a white arrow.
+/// Draw a simple arrow face: a solid background with a white arrow.
 ///
 /// Generated rather than shipped as a binary asset so the artwork stays editable - the files land
 /// in `predefined/` like any other action, and can be re-themed or replaced.
-fn arrow_picture(background: &str, pointing_right: bool) -> RgbaImage {
-	let mut canvas = RgbaImage::from_pixel(CANVAS, CANVAS, parse_colour(background));
+///
+/// Takes the canvas shape so the same glyph serves a square key and the strip's 2:1 rectangle. The
+/// arrow is sized from the shorter axis and centred, so widening the canvas gives it more room
+/// rather than stretching it.
+fn arrow_picture(width: u32, height: u32, background: &str, pointing_right: bool) -> RgbaImage {
+	let mut canvas = RgbaImage::from_pixel(width, height, parse_colour(background));
 	let white = Rgba([255, 255, 255, 255]);
 
-	let mid = CANVAS as i32 / 2;
-	let shaft_half = (CANVAS as f32 * 0.045).round() as i32;
-	let (shaft_start, shaft_end) = ((CANVAS as f32 * 0.28) as i32, (CANVAS as f32 * 0.66) as i32);
-	let head = (CANVAS as f32 * 0.20) as i32;
+	let scale = height as f32;
+	let mid_y = height as i32 / 2;
+	let centre_x = width as f32 / 2.0;
 
-	for y in (mid - shaft_half)..=(mid + shaft_half) {
-		for x in shaft_start..=shaft_end {
-			let x = if pointing_right { x } else { CANVAS as i32 - x };
+	let direction: i32 = if pointing_right { 1 } else { -1 };
+	// Fractions are measured from the centre, so mirroring is a sign flip.
+	let along = |fraction: f32| (centre_x + direction as f32 * fraction * scale).round() as i32;
+
+	let shaft_half = (scale * 0.045).round() as i32;
+	let (shaft_start, shaft_end) = (along(-0.22), along(0.16));
+	let (lo, hi) = (shaft_start.min(shaft_end), shaft_start.max(shaft_end));
+
+	for y in (mid_y - shaft_half)..=(mid_y + shaft_half) {
+		for x in lo..=hi {
 			blend(&mut canvas, x, y, white, 1.0);
 		}
 	}
 
-	// Triangular head: each step in from the tip widens the arm by one pixel.
-	let tip = if pointing_right { (CANVAS as f32 * 0.76) as i32 } else { CANVAS as i32 - (CANVAS as f32 * 0.76) as i32 };
-	for step in 0..head {
-		let x = if pointing_right { tip - step } else { tip + step };
-		for y in (mid - step)..=(mid + step) {
+	// Triangular head: each step back from the tip widens the arm by one pixel.
+	let tip = along(0.26);
+	for step in 0..(scale * 0.20) as i32 {
+		let x = tip - direction * step;
+		for y in (mid_y - step)..=(mid_y + step) {
 			blend(&mut canvas, x, y, white, 1.0);
+		}
+	}
+
+	canvas
+}
+
+/// Draw a brightness key face: a filled disc with rays.
+fn brightness_picture(background: &str) -> RgbaImage {
+	let mut canvas = RgbaImage::from_pixel(CANVAS, CANVAS, parse_colour(background));
+	let white = Rgba([255, 255, 255, 255]);
+	let centre = CANVAS as f32 / 2.0;
+	let disc = CANVAS as f32 * 0.17;
+
+	for y in 0..CANVAS as i32 {
+		for x in 0..CANVAS as i32 {
+			let (dx, dy) = (x as f32 - centre, y as f32 - centre);
+			if (dx * dx + dy * dy).sqrt() <= disc {
+				blend(&mut canvas, x, y, white, 1.0);
+			}
+		}
+	}
+
+	for ray in 0..8 {
+		let angle = std::f32::consts::TAU * ray as f32 / 8.0;
+		let (inner, outer) = (disc + CANVAS as f32 * 0.07, disc + CANVAS as f32 * 0.19);
+		let mut along = inner;
+		while along <= outer {
+			let (x, y) = (centre + angle.cos() * along, centre + angle.sin() * along);
+			// Thicken the ray so it survives the downscale to the device's own resolution.
+			for offset_y in -2..=2 {
+				for offset_x in -2..=2 {
+					blend(&mut canvas, x as i32 + offset_x, y as i32 + offset_y, white, 1.0);
+				}
+			}
+			along += 0.5;
 		}
 	}
 
@@ -185,6 +252,12 @@ fn ensure_predefined() {
 	] {
 		let directory = root.join(slug);
 		if directory.join("config.json").exists() {
+			// Strip artwork arrived after these entries did; fill it in without disturbing the rest.
+			if !directory.join(STRIP).exists()
+				&& let Err(error) = write_picture(arrow_picture(STRIP_SIZE.0, STRIP_SIZE.1, colour, pointing_right), &directory.join(STRIP))
+			{
+				log::error!("Failed to draw {name} strip artwork: {error}");
+			}
 			continue;
 		}
 		if let Err(error) = std::fs::create_dir_all(&directory) {
@@ -192,8 +265,12 @@ fn ensure_predefined() {
 			continue;
 		}
 
-		if let Err(error) = write_picture(arrow_picture(colour, pointing_right), &directory.join(PICTURE)) {
+		if let Err(error) = write_picture(arrow_picture(CANVAS, CANVAS, colour, pointing_right), &directory.join(PICTURE)) {
 			log::error!("Failed to draw {name} artwork: {error}");
+			continue;
+		}
+		if let Err(error) = write_picture(arrow_picture(STRIP_SIZE.0, STRIP_SIZE.1, colour, pointing_right), &directory.join(STRIP)) {
+			log::error!("Failed to draw {name} strip artwork: {error}");
 			continue;
 		}
 
@@ -202,12 +279,41 @@ fn ensure_predefined() {
 			name: name.to_owned(),
 			command: String::new(),
 			action: Some(uuid.to_owned()),
+			category: None,
 			image: PICTURE.to_owned(),
 			icon: None,
 			background: Some(colour.to_owned()),
 		};
 		if let Err(error) = write_config(&directory, &config) {
 			log::error!("Failed to write {name} config: {error}");
+		}
+	}
+
+	// The System group: first-party dial actions the app implements itself.
+	let directory = root.join("device-brightness");
+	if !directory.join("config.json").exists() {
+		let colour = "#7C3AED";
+		if let Err(error) = std::fs::create_dir_all(&directory) {
+			log::error!("Failed to create {}: {error}", directory.display());
+			return;
+		}
+		if let Err(error) = write_picture(brightness_picture(colour), &directory.join(PICTURE)) {
+			log::error!("Failed to draw Device Brightness artwork: {error}");
+			return;
+		}
+
+		let config = CustomActionConfig {
+			id: new_id(),
+			name: "Device Brightness".to_owned(),
+			command: String::new(),
+			action: Some(crate::shared::DEVICE_BRIGHTNESS_UUID.to_owned()),
+			category: Some("System".to_owned()),
+			image: PICTURE.to_owned(),
+			icon: None,
+			background: Some(colour.to_owned()),
+		};
+		if let Err(error) = write_config(&directory, &config) {
+			log::error!("Failed to write Device Brightness config: {error}");
 		}
 	}
 }
@@ -221,6 +327,29 @@ pub fn load() -> Vec<CustomAction> {
 pub fn load_predefined() -> Vec<CustomAction> {
 	ensure_predefined();
 	load_from(predefined_dir())
+}
+
+/// Compose the strip face for an action that predates it.
+///
+/// Recomposed from the stored source rather than scaled from the square picture, which already has
+/// the background baked in and is the wrong shape. Predefined entries are skipped: their artwork is
+/// generated rather than composed, so `ensure_predefined` fills those in instead.
+fn ensure_strip(directory: &Path, config: &CustomActionConfig) {
+	if config.action.is_some() || directory.join(STRIP).exists() {
+		return;
+	}
+
+	let source = config
+		.icon
+		.as_ref()
+		.map(|icon| directory.join(icon))
+		.filter(|path| std::fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false));
+
+	if let Err(error) = compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source.as_deref(), config.background.as_deref())
+		.and_then(|canvas| write_picture(canvas, &directory.join(STRIP)))
+	{
+		log::warn!("Failed to compose strip artwork in {}: {error}", directory.display());
+	}
 }
 
 /// Read every action in a library, skipping any directory whose config will not parse.
@@ -241,6 +370,8 @@ fn load_from(root: PathBuf) -> Vec<CustomAction> {
 				config.id = new_id();
 				let _ = write_config(&root.join(&slug), &config);
 			}
+
+			ensure_strip(&root.join(&slug), &config);
 			Some(CustomAction {
 				slug,
 				root: root.clone(),
@@ -361,26 +492,57 @@ pub fn has_transparency(path: &Path) -> bool {
 	image::open(path).map(|image| image.to_rgba8().pixels().any(|pixel| pixel[3] < 250)).unwrap_or(false)
 }
 
-/// Build the action's artwork inside its directory, copying the source image in alongside it.
+/// Paint the background, then the source image, onto a canvas of the given shape.
 ///
-/// The background is always painted first, then the image composited over it. How the image is
-/// placed depends on the image itself, so one picker covers both cases: a transparent icon is
-/// scaled to fit and inset so the colour reads as a border around it, while an opaque picture is
-/// centre-cropped to fill the key (where the background simply ends up hidden behind it).
+/// How the image is placed depends on the image itself, so one picker covers both cases: a
+/// transparent icon is scaled to fit and inset so the colour reads as a border around it, while an
+/// opaque picture is centre-cropped to fill (where the background ends up hidden behind it).
 ///
-/// Returns the copied source's filename, if there was one.
-fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
-	std::fs::create_dir_all(directory)?;
-
-	let mut canvas = RgbaImage::new(CANVAS, CANVAS);
-	if let Some(background) = &spec.background {
+/// Taking the shape as a parameter is what lets the touch strip have its own render. The strip is a
+/// 2:1 rectangle, so displaying the square key face there would stretch a photo; cropping a fresh
+/// 2:1 canvas from the original keeps its proportions.
+fn compose_canvas(width: u32, height: u32, file: Option<&Path>, background: Option<&str>) -> Result<RgbaImage> {
+	let mut canvas = RgbaImage::new(width, height);
+	if let Some(background) = background {
 		let colour = parse_colour(background);
 		for pixel in canvas.pixels_mut() {
 			*pixel = colour;
 		}
 	}
 
+	if let Some(file) = file {
+		// An icon is inset by a tenth so the background reads as a border; a picture fills the face.
+		let (inset, fit) = if has_transparency(file) { (0.1, Fit::Contain) } else { (0.0, Fit::Cover) };
+		let margin_x = (width as f32 * inset).round() as u32;
+		let margin_y = (height as f32 * inset).round() as u32;
+
+		let decoded = decode(file, width - margin_x * 2, height - margin_y * 2, fit)?;
+		for (x, y, pixel) in decoded.enumerate_pixels() {
+			blend(
+				&mut canvas,
+				margin_x as i32 + x as i32,
+				margin_y as i32 + y as i32,
+				*pixel,
+				pixel[3] as f32 / 255.0,
+			);
+		}
+	}
+
+	Ok(canvas)
+}
+
+/// Build the action's artwork inside its directory, copying the source image in alongside it.
+///
+/// Two faces are written from the same ingredients: the square [`PICTURE`] for a key, and the 2:1
+/// [`STRIP`] for the touch-strip rectangle above a dial. Composing the strip separately rather than
+/// scaling the square one is the whole point - the rectangle would otherwise stretch the artwork.
+///
+/// Returns the copied source's filename, if there was one.
+fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
+	std::fs::create_dir_all(directory)?;
+
 	let mut source_name = None;
+	let mut stored_source = None;
 
 	if let Some(file) = &spec.file {
 		// Keep the source so a later edit can recompose it against a different background.
@@ -394,21 +556,15 @@ fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
 			std::fs::copy(file, &stored)?;
 		}
 		source_name = Some(name);
-
-		let (size, fit) = if has_transparency(file) {
-			((CANVAS as f32 * 0.8).round() as u32, Fit::Contain)
-		} else {
-			(CANVAS, Fit::Cover)
-		};
-
-		let decoded = decode(file, size, size, fit)?;
-		let offset = (CANVAS as i32 - size as i32) / 2;
-		for (x, y, pixel) in decoded.enumerate_pixels() {
-			blend(&mut canvas, offset + x as i32, offset + y as i32, *pixel, pixel[3] as f32 / 255.0);
-		}
+		stored_source = Some(file.clone());
 	}
 
-	write_picture(canvas, &directory.join(PICTURE))?;
+	let background = spec.background.as_deref();
+	let source = stored_source.as_deref();
+
+	write_picture(compose_canvas(CANVAS, CANVAS, source, background)?, &directory.join(PICTURE))?;
+	write_picture(compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source, background)?, &directory.join(STRIP))?;
+
 	Ok(source_name)
 }
 
@@ -432,6 +588,7 @@ pub fn create(name: String, command: String, spec: &ImageSpec) -> Result<CustomA
 		name,
 		command,
 		action: None,
+		category: None,
 		image: PICTURE.to_owned(),
 		icon,
 		background: spec.background.clone(),

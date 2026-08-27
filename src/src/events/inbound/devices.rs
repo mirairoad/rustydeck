@@ -26,6 +26,19 @@ pub async fn register_device(uuid: &str, mut event: PayloadEvent<crate::shared::
 
 		let mut locks = crate::store::profiles::acquire_locks_mut().await;
 		let selected_profile = locks.device_stores.get_selected_profile(&event.payload.id)?;
+
+		// Dials used to live in the profile beside the rectangle above them. Lift any existing
+		// setup to where dials live now - once, and without touching the profile itself.
+		let sliders = locks
+			.profile_stores
+			.get_profile_store(&DEVICES.get(&event.payload.id).unwrap(), &selected_profile)?
+			.value
+			.sliders
+			.clone();
+		if let Err(error) = locks.device_stores.seed_dials(&event.payload.id, event.payload.encoders as usize, &sliders) {
+			log::error!("Failed to seed dials for device {}: {error}", event.payload.id);
+		}
+
 		let profile = locks.profile_stores.get_profile_store(&DEVICES.get(&event.payload.id).unwrap(), &selected_profile)?;
 		for instance in profile
 			.value
