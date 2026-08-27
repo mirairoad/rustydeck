@@ -7,6 +7,7 @@ use crate::device_render::{render_state, resolve_image_path};
 use crate::events::frontend;
 use crate::frontend_events::{self, FrontendEvent};
 use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, PAGE_LEFT_UUID, PAGE_RIGHT_UUID, Profile};
+use crate::store::profiles::DialConfig;
 
 use std::rc::Rc;
 
@@ -21,6 +22,7 @@ use gpui_component::{
     dialog::DialogButtonProps,
     WindowExt, h_flex,
     input::{Input, InputState},
+    select::{Select, SelectEvent, SelectItem, SelectState},
     sidebar::{Sidebar, SidebarGroup},
     v_flex,
 };
@@ -41,6 +43,10 @@ const ROW_MENU_WIDTH: f32 = 120.0;
 
 /// Diameter of the dial knobs drawn beneath the touch strip.
 const DIAL_SIZE: f32 = 44.0;
+
+/// The predefined group holding first-party dial actions. Hidden from the palette - see
+/// `render_sidebar`.
+const SYSTEM_CATEGORY: &str = "System";
 
 const KEYPAD_CONTROLLER: &str = "Keypad";
 const ENCODER_CONTROLLER: &str = "Encoder";
@@ -114,6 +120,81 @@ impl ActionForm {
     }
 }
 
+/// What a dial is set to.
+#[derive(Clone, PartialEq)]
+enum DialKind {
+    /// Nothing - the dial does not act.
+    None,
+    /// A first-party action the app implements itself, named by its UUID.
+    System(SharedString),
+    /// Shell commands typed into the dial dialog, run through Run Command.
+    Custom,
+}
+
+/// One entry in the dial dialog's action picker.
+#[derive(Clone)]
+struct DialChoice {
+    label: SharedString,
+    kind: DialKind,
+}
+
+impl SelectItem for DialChoice {
+    type Value = DialKind;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.kind
+    }
+}
+
+/// The picker's entries: nothing, then every system action that is actually implemented, then the
+/// custom-commands entry.
+fn dial_choices() -> Vec<DialChoice> {
+    let mut choices = vec![DialChoice {
+        label: "None".into(),
+        kind: DialKind::None,
+    }];
+
+    choices.extend(crate::system_actions::CATALOGUE.iter().map(|(label, uuid)| DialChoice {
+        label: SharedString::from(*label),
+        kind: DialKind::System(SharedString::from(*uuid)),
+    }));
+
+    choices.push(DialChoice {
+        label: "Custom".into(),
+        kind: DialKind::Custom,
+    });
+    choices
+}
+
+/// The shell commands a custom dial runs, one per gesture the knob itself produces.
+///
+/// The tap is deliberately absent: it belongs to the rectangle above the dial, which is page-scoped
+/// and configured by dropping an action onto it.
+struct DialCommands {
+    /// Turning the dial anticlockwise.
+    left: String,
+    /// Turning it clockwise.
+    right: String,
+    /// Pressing it in.
+    centre: String,
+}
+
+/// Transient state of the dial dialog, kept in its own entity for the same reason as
+/// [`ActionForm`]: the dialog's builder runs inside the shell's own render, so it cannot read the
+/// shell back.
+struct DialForm {
+    /// Which dial the open dialog is configuring.
+    dial: u8,
+    kind: Entity<SelectState<Vec<DialChoice>>>,
+    left: Entity<InputState>,
+    right: Entity<InputState>,
+    centre: Entity<InputState>,
+}
+
 pub struct RustyDeckShell {
     device: Option<DeviceInfo>,
     profile: Option<Profile>,
@@ -129,10 +210,16 @@ pub struct RustyDeckShell {
     pages: Vec<String>,
     current_page: String,
     form: Entity<ActionForm>,
+    dial_form: Entity<DialForm>,
+    /// What each dial on the current device does. Device-scoped, so unlike `profile` it survives a
+    /// page change.
+    dials: Vec<Option<DialConfig>>,
     /// Id of the custom action whose `...` menu is open.
     row_menu_open: Option<String>,
     /// Slot whose right-click menu is open.
     slot_menu_open: Option<SlotContext>,
+    /// Index of the dial whose right-click menu is open.
+    dial_menu_open: Option<u8>,
 }
 
 impl RustyDeckShell {
@@ -151,6 +238,20 @@ impl RustyDeckShell {
             }
         })
         .detach();
+
+        let dial_form = cx.new(|cx| DialForm {
+            dial: 0,
+            kind: cx.new(|cx| SelectState::new(dial_choices(), None, window, cx)),
+            left: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-")),
+            right: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+")),
+            centre: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")),
+        });
+
+        // The dialog's fields are built during the shell's own render, so picking "Custom" only
+        // reveals the command inputs if the shell is told to draw again.
+        let dial_kind = dial_form.read(cx).kind.clone();
+        cx.subscribe(&dial_kind, |_this, _state, _event: &SelectEvent<Vec<DialChoice>>, cx| cx.notify())
+            .detach();
 
         Self {
             device: None,
@@ -171,8 +272,11 @@ impl RustyDeckShell {
                 existing_image: None,
                 editing: None,
             }),
+            dial_form,
+            dials: Vec::new(),
             row_menu_open: None,
             slot_menu_open: None,
+            dial_menu_open: None,
         }
     }
 
@@ -219,44 +323,150 @@ impl RustyDeckShell {
         .detach();
     }
 
-    /// Placeholder for per-dial configuration.
+    /// Configure one dial: a system action, or the user's own command per gesture of the knob.
+    ///
+    /// A dial is device-scoped - the knob is a fixed control, so it keeps doing the same thing
+    /// whichever page is showing. The rectangle above it is the page-scoped half: it owns the
+    /// artwork and the tap, and is configured by dropping an action onto it. The two no longer
+    /// share a slot, so neither can overwrite the other.
     fn open_dial_dialog(&mut self, dial: u8, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.dials.get(dial as usize).cloned().flatten();
+
+        let kind = match &existing {
+            None => DialKind::None,
+            Some(DialConfig::System { uuid }) => DialKind::System(SharedString::from(uuid.clone())),
+            Some(DialConfig::Custom { .. }) => DialKind::Custom,
+        };
+
+        // Prefill from what the dial already does, so opening the modal and saving without
+        // touching anything leaves it exactly as it was.
+        let (left, right, centre) = match &existing {
+            Some(DialConfig::Custom { left, right, centre }) => (left.clone(), right.clone(), centre.clone()),
+            _ => (String::new(), String::new(), String::new()),
+        };
+
+        let form = self.dial_form.clone();
+        form.update(cx, |form, cx| {
+            form.dial = dial;
+            form.kind.update(cx, |state, cx| state.set_selected_value(&kind, window, cx));
+            form.left.update(cx, |state, cx| state.set_value(left, window, cx));
+            form.right.update(cx, |state, cx| state.set_value(right, window, cx));
+            form.centre.update(cx, |state, cx| state.set_value(centre, window, cx));
+        });
+
+        let this = cx.entity().downgrade();
         let title = SharedString::from(format!("Dial {}", dial + 1));
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let this = this.clone();
+            let ok_form = form.clone();
+            let kind_state = form.read(cx).kind.clone();
+            let left_state = form.read(cx).left.clone();
+            let right_state = form.read(cx).right.clone();
+            let centre_state = form.read(cx).centre.clone();
+            // Only the custom entry takes commands; a system action configures itself.
+            let is_custom = kind_state.read(cx).selected_value() == Some(&DialKind::Custom);
+
             dialog
                 .title(title.clone())
-                .child(div().p_4().text_sm().child("Dial settings will live here."))
+                .button_props(DialogButtonProps::default().ok_text("Save").cancel_text("Cancel"))
+                // Footer buttons only render when a footer is set - see `open_action_dialog`.
+                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .p_2()
+                        .child(field("Action", Select::new(&kind_state).placeholder("Choose an action")))
+                        .when(is_custom, |body| {
+                            body.child(field("Left", Input::new(&left_state)))
+                                .child(field("Right", Input::new(&right_state)))
+                                .child(field("Centre", Input::new(&centre_state)))
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Applies on every page. The strip above the dial is set per page, by dropping an action on it."),
+                        ),
+                )
+                .on_ok(move |_event, _window, cx| {
+                    let kind = kind_state.read(cx).selected_value().cloned().unwrap_or(DialKind::None);
+                    let commands = DialCommands {
+                        left: left_state.read(cx).value().to_string(),
+                        right: right_state.read(cx).value().to_string(),
+                        centre: centre_state.read(cx).value().to_string(),
+                    };
+                    let dial = ok_form.read(cx).dial;
+                    let _ = this.update(cx, |this, cx| this.apply_dial(dial, kind, commands, cx));
+                    true
+                })
         });
     }
 
+    /// What to caption a knob with: the system action's name, or "Custom" for shell commands.
+    fn dial_label(&self, dial: u8) -> SharedString {
+        match self.dials.get(dial as usize).and_then(|slot| slot.as_ref()) {
+            None => SharedString::from("Unset"),
+            Some(DialConfig::Custom { .. }) => SharedString::from("Custom"),
+            Some(DialConfig::System { uuid }) => crate::system_actions::CATALOGUE
+                .iter()
+                .find(|(_, candidate)| candidate == uuid)
+                .map(|(label, _)| SharedString::from(*label))
+                .unwrap_or_else(|| SharedString::from(uuid.clone())),
+        }
+    }
+
+    /// Clear a dial from its right-click menu, leaving the rectangle above it untouched.
+    fn unset_dial(&mut self, dial: u8, cx: &mut Context<Self>) {
+        self.dial_menu_open = None;
+        self.apply_dial(
+            dial,
+            DialKind::None,
+            DialCommands {
+                left: String::new(),
+                right: String::new(),
+                centre: String::new(),
+            },
+            cx,
+        );
+    }
+
+    /// Save the dial dialog's result to the device's own store.
+    fn apply_dial(&mut self, dial: u8, kind: DialKind, commands: DialCommands, cx: &mut Context<Self>) {
+        let Some(device) = self.device.as_ref() else { return };
+        let (id, encoders) = (device.id.clone(), device.encoders as usize);
+
+        let config = match kind {
+            DialKind::None => None,
+            DialKind::System(uuid) => Some(DialConfig::System { uuid: uuid.to_string() }),
+            DialKind::Custom => Some(DialConfig::Custom {
+                left: commands.left,
+                right: commands.right,
+                centre: commands.centre,
+            }),
+        };
+
+        cx.spawn(async move |this, cx| {
+            let result = crate::bridge(async move {
+                let mut locks = crate::store::profiles::acquire_locks_mut().await;
+                locks.device_stores.set_dial(&id, encoders, dial, config)
+            })
+            .await;
+
+            if let Err(error) = result {
+                log::error!("Failed to save dial {dial}: {error}");
+                return;
+            }
+            reload_dials(&this, cx).await;
+        })
+        .detach();
+    }
+
     /// Run a custom action's command directly, without going through the deck.
-    ///
-    /// Unlike the plugin's own runner - which spawns `sh` and never inspects the result - this
-    /// reports a non-zero exit and its stderr, so a broken command says so instead of silently
-    /// doing nothing.
     fn execute_command(&mut self, command: String, cx: &mut Context<Self>) {
         self.row_menu_open = None;
         cx.notify();
-
-        crate::spawn(async move {
-            log::info!("Executing custom action command: {command}");
-
-            // Run through the user's login shell rather than plain `sh -c`, so aliases and shell
-            // functions resolve. Omarchy, for instance, provides `open` as a bash function - it
-            // works in a terminal but is invisible to a non-interactive POSIX shell, which makes a
-            // perfectly good command look like it silently does nothing.
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_owned());
-            match tokio::process::Command::new(&shell).arg("-lic").arg(&command).output().await {
-                Ok(output) if output.status.success() => log::info!("Command finished: {command}"),
-                Ok(output) => log::error!(
-                    "Command failed ({}): {} - {}",
-                    output.status,
-                    command,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                Err(error) => log::error!("Could not run command {command}: {error}"),
-            }
-        });
+        crate::system_actions::run_shell(command);
     }
 
     fn delete_custom_action(&mut self, id: String, cx: &mut Context<Self>) {
@@ -438,12 +648,20 @@ impl RustyDeckShell {
             };
             let context = instance.context.clone();
 
-            // `settings.down` is the key `RunCommandSettings` reads for the key-press command.
-            // `rustydeck_custom` links the key back to the library entry it came from, so editing
-            // that entry later updates this key rather than leaving a stale copy behind.
+            // The action's one command is written to both gestures a slot can receive: `down` for
+            // a key press, `touch` for a tap of the strip rectangle. A key never receives a tap and
+            // a rectangle never receives a press (dials are device-scoped and do not reach plugins
+            // at all), so exactly one of the two ever fires and the action needs only one command.
+            //
+            // `rustydeck_custom` links the slot back to the library entry it came from, so editing
+            // that entry later updates this slot rather than leaving a stale copy behind.
             // `RunCommandSettings` is `#[serde(default)]` and ignores keys it does not know.
             let payload = if is_command {
-                serde_json::json!({ "down": action.command(), "rustydeck_custom": action.id() })
+                serde_json::json!({
+                    "down": action.command(),
+                    "touch": action.command(),
+                    "rustydeck_custom": action.id(),
+                })
             } else {
                 serde_json::json!({ "rustydeck_custom": action.id() })
             };
@@ -459,7 +677,10 @@ impl RustyDeckShell {
             }
 
             if let Some(mut state) = instance.states.first().cloned() {
-                state.image = action.image_path().to_string_lossy().into_owned();
+                // The strip rectangle is 2:1, so it gets the face composed for that shape - showing
+                // the square key face there would stretch the artwork.
+                let artwork = if context.controller == ENCODER_CONTROLLER { action.strip_path() } else { action.image_path() };
+                state.image = artwork.to_string_lossy().into_owned();
                 if let Err(error) = crate::bridge(frontend::instances::set_state(context, 0, state)).await {
                     log::error!("Failed to set image on custom action: {error}");
                 }
@@ -489,6 +710,7 @@ impl RustyDeckShell {
                 this.profile = Some(profile.clone());
                 cx.notify();
             });
+            reload_dials(&this, cx).await;
             push_device_images(device, profile).await;
         })
         .detach();
@@ -717,6 +939,31 @@ async fn push_device_images(device: DeviceInfo, profile: Profile) {
 ///
 /// Cheaper to re-read than to replay the backend's relocation rules up here - contexts, child
 /// indices and image paths all shift on a move, and one source of truth is enough.
+/// Re-read the device's dials into the shell.
+///
+/// Separate from [`reload_profile`] because dials are device-scoped: they do not change when the
+/// page does, and they outlive any one profile.
+async fn reload_dials(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
+    let Some(device) = this.update(cx, |this, _| this.device.clone()).ok().flatten() else {
+        return;
+    };
+    let (id, encoders) = (device.id.clone(), device.encoders as usize);
+
+    let Ok(dials) = crate::bridge(async move {
+        let mut locks = crate::store::profiles::acquire_locks_mut().await;
+        locks.device_stores.get_dials(&id, encoders)
+    })
+    .await
+    else {
+        return;
+    };
+
+    let _ = this.update(cx, |this, cx| {
+        this.dials = dials;
+        cx.notify();
+    });
+}
+
 async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
     let Some(device) = this.update(cx, |this, _| this.device.clone()).ok().flatten() else {
         return;
@@ -777,10 +1024,16 @@ async fn sync_custom_instances(device: &DeviceInfo, profile: &Profile) -> bool {
                 continue;
             };
 
-            let image = action.image_path().to_string_lossy().into_owned();
+            // The strip rectangle is 2:1 and gets the face composed for that shape.
+            let artwork = if controller == ENCODER_CONTROLLER { action.strip_path() } else { action.image_path() };
+            let image = artwork.to_string_lossy().into_owned();
+
             // Predefined entries place a built-in action and have no command to keep in step.
+            // Both gestures carry the same command - see `handle_create_custom` - so both have to
+            // match, or a slot created before one of them existed never gets brought back in line.
+            let setting = |key: &str| instance.settings.get(key).and_then(|value| value.as_str());
             let command_matches =
-                action.action_uuid().is_some() || instance.settings.get("down").and_then(|c| c.as_str()) == Some(action.command());
+                action.action_uuid().is_some() || (setting("down") == Some(action.command()) && setting("touch") == Some(action.command()));
             let image_matches = instance.states.first().map(|state| state.image.as_str()) == Some(image.as_str());
             if command_matches && image_matches {
                 continue;
@@ -799,7 +1052,11 @@ async fn sync_custom_instances(device: &DeviceInfo, profile: &Profile) -> bool {
             if !command_matches {
                 let event = crate::events::inbound::ContextAndPayloadEvent {
                     context: context.clone(),
-                    payload: serde_json::json!({ "down": action.command(), "rustydeck_custom": id }),
+                    payload: serde_json::json!({
+                        "down": action.command(),
+                        "touch": action.command(),
+                        "rustydeck_custom": id,
+                    }),
                 };
                 if let Err(error) = crate::bridge(crate::events::inbound::settings::set_settings(event, true)).await {
                     log::error!("Failed to re-sync custom action command: {error}");
@@ -849,6 +1106,7 @@ async fn refresh_catalogue(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::Asy
 
     if newly_selected.is_some() {
         reload_profile(this, cx).await;
+        reload_dials(this, cx).await;
     }
 }
 
@@ -1216,17 +1474,29 @@ impl RustyDeckShell {
             }
         }));
 
-        let predefined_rows: Vec<PaletteRow> = self
-            .predefined
-            .iter()
-            .cloned()
-            .map(|action| PaletteRow::Predefined { action, collapsed })
-            .collect();
+        // Predefined entries carry their own section name, so the shipped groups sit apart from
+        // each other without needing a second mechanism.
+        //
+        // System actions are deliberately absent: they belong to dials, which are device-scoped and
+        // configured from the dial modal rather than by dragging. Listing them here would offer a
+        // drag onto a key or rectangle that cannot do anything with them.
+        let mut sections: Vec<(String, Vec<PaletteRow>)> = Vec::new();
+        for action in self.predefined.iter().filter(|action| action.category() != SYSTEM_CATEGORY) {
+            let category = action.category().to_owned();
+            let row = PaletteRow::Predefined {
+                action: action.clone(),
+                collapsed,
+            };
+            match sections.iter_mut().find(|(name, _)| *name == category) {
+                Some((_, rows)) => rows.push(row),
+                None => sections.push((category, vec![row])),
+            }
+        }
 
-        Sidebar::left().collapsed(collapsed).children(vec![
-            SidebarGroup::new("Custom actions").children(custom_rows),
-            SidebarGroup::new("Predefined actions").children(predefined_rows),
-        ])
+        let mut groups = vec![SidebarGroup::new("Custom actions").children(custom_rows)];
+        groups.extend(sections.into_iter().map(|(name, rows)| SidebarGroup::new(SharedString::from(name)).children(rows)));
+
+        Sidebar::left().collapsed(collapsed).children(groups)
     }
 
     /// Page controls, sat in the bottom-right of the device view.
@@ -1312,28 +1582,83 @@ impl RustyDeckShell {
             })));
         }
 
-        // The physical dials. The strip above shows what each dial *displays*; these are the knobs
-        // themselves, which will get their own configuration.
+        // The physical knobs. These are device-scoped and no longer share a slot with the strip
+        // segment above them, so the segment's artwork says nothing about what the dial does - each
+        // knob has to caption itself, or a configured dial would be invisible.
         if device.encoders > 0 {
             let encoders = device.encoders;
             let segment_width = (keypad_width - (encoders.saturating_sub(1)) as f32 * GAP) / encoders as f32;
 
             shell = shell.child(div().flex().flex_row().gap(px(GAP)).mt(px(GAP * 2.0)).children((0..encoders).map(|dial| {
-                div()
+                let configured = self.dials.get(dial as usize).is_some_and(|slot| slot.is_some());
+                let label = self.dial_label(dial);
+
+                let mut knob = div()
+                    .id(("dial", dial as usize))
+                    .size(px(DIAL_SIZE))
+                    .rounded_full()
+                    .bg(if configured { cx.theme().accent } else { cx.theme().secondary })
+                    .border_1()
+                    .border_color(if configured { cx.theme().primary } else { cx.theme().border })
+                    .hover(|style| style.bg(cx.theme().accent))
+                    .on_click(cx.listener(move |this, _event, window, cx| this.open_dial_dialog(dial, window, cx)));
+
+                // Only a configured dial has anything to clear.
+                if configured {
+                    knob = knob.on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.dial_menu_open = Some(dial);
+                            cx.notify();
+                        }),
+                    );
+                }
+
+                v_flex()
+                    .relative()
                     .w(px(segment_width))
-                    .flex()
-                    .justify_center()
+                    .items_center()
+                    .gap_1()
+                    .child(knob)
                     .child(
                         div()
-                            .id(("dial", dial as usize))
-                            .size(px(DIAL_SIZE))
-                            .rounded_full()
-                            .bg(cx.theme().secondary)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .hover(|style| style.bg(cx.theme().accent))
-                            .on_click(cx.listener(move |this, _event, window, cx| this.open_dial_dialog(dial, window, cx))),
+                            .text_xs()
+                            .text_color(if configured { cx.theme().foreground } else { cx.theme().muted_foreground })
+                            .child(label),
                     )
+                    .when(self.dial_menu_open == Some(dial), |wrapper| {
+                        // Same layering as the slot menu: painted last so nothing covers it, and
+                        // occluding so the click cannot fall through to the knob beneath.
+                        wrapper.child(
+                            deferred(
+                                v_flex()
+                                    .occlude()
+                                    .absolute()
+                                    .top_full()
+                                    .w(px(ROW_MENU_WIDTH))
+                                    .p_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().background)
+                                    .shadow_lg()
+                                    .child(
+                                        div()
+                                            .id(("dial-unset", dial as usize))
+                                            .w_full()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .text_sm()
+                                            .text_color(cx.theme().danger)
+                                            .hover(|style| style.bg(cx.theme().accent))
+                                            .child("Unset")
+                                            .on_click(cx.listener(move |this, _event, _window, cx| this.unset_dial(dial, cx))),
+                                    ),
+                            )
+                            .with_priority(1),
+                        )
+                    })
             })));
         }
 
@@ -1361,7 +1686,9 @@ impl Render for RustyDeckShell {
             // Click-outside-to-close for the row menu and the device picker. A plain last child
             // covers the window and sits above everything normal, while the menus themselves are
             // `deferred` and so still paint above this.
-            .when(self.row_menu_open.is_some() || self.device_picker_open || self.slot_menu_open.is_some(), |shell| {
+            .when(
+                self.row_menu_open.is_some() || self.device_picker_open || self.slot_menu_open.is_some() || self.dial_menu_open.is_some(),
+                |shell| {
                 shell.child(
                     div()
                         .id("dismiss-overlay")
@@ -1372,11 +1699,13 @@ impl Render for RustyDeckShell {
                         .on_click(cx.listener(|this, _event, _window, cx| {
                             this.row_menu_open = None;
                             this.slot_menu_open = None;
+                            this.dial_menu_open = None;
                             this.device_picker_open = false;
                             cx.notify();
                         })),
-                )
-            })
+                    )
+                },
+            )
             // `Root::render` only draws the app's own view - dialogs and notifications are
             // separate layers the hosting view is expected to place on top of itself.
             .children(gpui_component::Root::render_dialog_layer(window, cx))

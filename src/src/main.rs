@@ -11,6 +11,7 @@ mod plugins;
 mod power_events;
 mod shared;
 mod store;
+mod system_actions;
 mod ui;
 mod zip_extract;
 
@@ -18,7 +19,6 @@ mod built_info {
 	include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
 
-use events::frontend;
 use shared::PRODUCT_NAME;
 
 use std::future::Future;

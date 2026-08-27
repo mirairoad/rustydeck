@@ -13,10 +13,31 @@ use tokio::sync::RwLock;
 
 pub const PRODUCT_NAME: &str = include_str!("../../product_name.txt").trim_ascii();
 
+/// The plugin namespace the app claims for the actions it implements itself.
+///
+/// These have no directory under `plugins/` to find, because there is no plugin process behind
+/// them - so anything that decides whether an action's plugin is still installed has to know this
+/// name, alongside upstream's `opendeck`. See `store::profiles::get_profile_store_mut`.
+pub const BUILTIN_PLUGIN: &str = "rustydeck";
+
+/// Upstream's namespace for the actions OpenDeck itself implements (multi-action, toggle action).
+pub const UPSTREAM_BUILTIN_PLUGIN: &str = "opendeck";
+
+/// Is this action implemented by the app rather than by a plugin on disk?
+pub fn is_builtin_plugin(plugin: &str) -> bool {
+	plugin == BUILTIN_PLUGIN || plugin == UPSTREAM_BUILTIN_PLUGIN
+}
+
 /// Built-in page-stepping actions, dispatched by UUID in `events::outbound::keypad` rather than
 /// being sent to a plugin - the same way `opendeck.multiaction` is handled.
 pub const PAGE_LEFT_UUID: &str = "rustydeck.pageleft";
 pub const PAGE_RIGHT_UUID: &str = "rustydeck.pageright";
+
+/// Built-in "System" actions: first-party, encoder-aware, and not backed by a plugin.
+pub const DEVICE_BRIGHTNESS_UUID: &str = "rustydeck.devicebrightness";
+pub const VOLUME_UUID: &str = "rustydeck.volume";
+pub const MIC_UUID: &str = "rustydeck.mic";
+pub const DISPLAY_BRIGHTNESS_UUID: &str = "rustydeck.displaybrightness";
 
 pub fn copy_dir(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), std::io::Error> {
 	use std::fs;
@@ -491,7 +512,7 @@ pub static CATEGORIES: LazyLock<RwLock<HashMap<String, Category>>> = LazyLock::n
 					{
 						"name": "Multi Action",
 						"icon": "opendeck/multi-action.png",
-						"plugin": "opendeck",
+						"plugin": UPSTREAM_BUILTIN_PLUGIN,
 						"uuid": "opendeck.multiaction",
 						"tooltip": "Execute multiple actions",
 						"controllers": [ "Keypad" ],
@@ -504,7 +525,7 @@ pub static CATEGORIES: LazyLock<RwLock<HashMap<String, Category>>> = LazyLock::n
 					{
 						"name": "Toggle Action",
 						"icon": "opendeck/toggle-action.png",
-						"plugin": "opendeck",
+						"plugin": UPSTREAM_BUILTIN_PLUGIN,
 						"uuid": "opendeck.toggleaction",
 						"tooltip": "Cycle through multiple actions",
 						"controllers": [ "Keypad" ],
@@ -520,7 +541,7 @@ pub static CATEGORIES: LazyLock<RwLock<HashMap<String, Category>>> = LazyLock::n
 					{
 						"name": "Page Left",
 						"icon": "",
-						"plugin": "rustydeck",
+						"plugin": BUILTIN_PLUGIN,
 						"uuid": PAGE_LEFT_UUID,
 						"tooltip": "Switch to the previous page",
 						"controllers": [ "Keypad", "Encoder" ],
@@ -531,9 +552,62 @@ pub static CATEGORIES: LazyLock<RwLock<HashMap<String, Category>>> = LazyLock::n
 				.unwrap(),
 				serde_json::from_value(serde_json::json!(
 					{
+						"name": "Output Volume",
+						"icon": "",
+						"plugin": BUILTIN_PLUGIN,
+						"uuid": VOLUME_UUID,
+						"tooltip": "Adjust the default output volume",
+						"controllers": [ "Encoder" ],
+						"states": [ { "image": "" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				serde_json::from_value(serde_json::json!(
+					{
+						"name": "Input Volume",
+						"icon": "",
+						"plugin": BUILTIN_PLUGIN,
+						"uuid": MIC_UUID,
+						"tooltip": "Adjust the default microphone volume",
+						"controllers": [ "Encoder" ],
+						"states": [ { "image": "" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				serde_json::from_value(serde_json::json!(
+					{
+						"name": "Display Brightness",
+						"icon": "",
+						"plugin": BUILTIN_PLUGIN,
+						"uuid": DISPLAY_BRIGHTNESS_UUID,
+						"tooltip": "Adjust the monitor's brightness",
+						"controllers": [ "Encoder" ],
+						"states": [ { "image": "" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				serde_json::from_value(serde_json::json!(
+					{
+						"name": "Device Brightness",
+						"icon": "",
+						"plugin": BUILTIN_PLUGIN,
+						"uuid": DEVICE_BRIGHTNESS_UUID,
+						"tooltip": "Adjust the deck's own brightness",
+						// Encoder-only by design: this is a dial action, not a button.
+						"controllers": [ "Encoder" ],
+						"states": [ { "image": "" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				serde_json::from_value(serde_json::json!(
+					{
 						"name": "Page Right",
 						"icon": "",
-						"plugin": "rustydeck",
+						"plugin": BUILTIN_PLUGIN,
 						"uuid": PAGE_RIGHT_UUID,
 						"tooltip": "Switch to the next page",
 						"controllers": [ "Keypad", "Encoder" ],
