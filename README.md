@@ -24,6 +24,11 @@ A dial is a fixed control, so it keeps doing the same thing whichever page is
 showing. The rectangle above it is the page-scoped half. They do not share a
 slot, so neither can overwrite the other.
 
+Dials are rearranged by dragging one knob onto another, which exchanges the two -
+dropping onto an unset dial is how one gets moved. A dial running your own
+commands can be given a name to caption the knob with; leave it blank and it
+stays "Custom".
+
 Artwork is composed twice from one source - a square face for keys and a 2:1
 face for the strip - because scaling one into the other stretches it. The create
 dialog previews both.

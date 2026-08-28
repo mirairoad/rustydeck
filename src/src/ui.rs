@@ -120,6 +120,16 @@ struct DraggedKey {
     image: Option<String>,
 }
 
+/// A configured dial being dragged onto another dial to exchange the two.
+///
+/// Carries the position rather than the config: dials are device-scoped, so the store is the one
+/// authority on what each knob does and the swap is resolved there.
+#[derive(Clone)]
+struct DraggedDial {
+    dial: u8,
+    label: SharedString,
+}
+
 /// A palette entry being dragged onto the grid to create a new instance.
 #[derive(Clone)]
 struct DraggedAction {
@@ -227,6 +237,8 @@ fn dial_choices() -> Vec<DialChoice> {
 /// The tap is deliberately absent: it belongs to the rectangle above the dial, which is page-scoped
 /// and configured by dropping an action onto it.
 struct DialCommands {
+    /// What to caption the knob with. Blank falls back to "Custom".
+    name: String,
     /// Turning the dial anticlockwise.
     left: String,
     /// Turning it clockwise.
@@ -242,6 +254,7 @@ struct DialForm {
     /// Which dial the open dialog is configuring.
     dial: u8,
     kind: Entity<SelectState<Vec<DialChoice>>>,
+    name: Entity<InputState>,
     left: Entity<InputState>,
     right: Entity<InputState>,
     centre: Entity<InputState>,
@@ -303,6 +316,8 @@ impl RustyDeckShell {
         let dial_form = cx.new(|cx| DialForm {
             dial: 0,
             kind: cx.new(|cx| SelectState::new(dial_choices(), None, window, cx)),
+            // Blank is a valid name, so the placeholder is the fallback caption itself.
+            name: cx.new(|cx| InputState::new(window, cx).placeholder("Custom")),
             left: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-")),
             right: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+")),
             centre: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")),
@@ -406,15 +421,16 @@ impl RustyDeckShell {
 
         // Prefill from what the dial already does, so opening the modal and saving without
         // touching anything leaves it exactly as it was.
-        let (left, right, centre) = match &existing {
-            Some(DialConfig::Custom { left, right, centre }) => (left.clone(), right.clone(), centre.clone()),
-            _ => (String::new(), String::new(), String::new()),
+        let (name, left, right, centre) = match &existing {
+            Some(DialConfig::Custom { name, left, right, centre }) => (name.clone(), left.clone(), right.clone(), centre.clone()),
+            _ => (String::new(), String::new(), String::new(), String::new()),
         };
 
         let form = self.dial_form.clone();
         form.update(cx, |form, cx| {
             form.dial = dial;
             form.kind.update(cx, |state, cx| state.set_selected_value(&kind, window, cx));
+            form.name.update(cx, |state, cx| state.set_value(name, window, cx));
             form.left.update(cx, |state, cx| state.set_value(left, window, cx));
             form.right.update(cx, |state, cx| state.set_value(right, window, cx));
             form.centre.update(cx, |state, cx| state.set_value(centre, window, cx));
@@ -427,6 +443,7 @@ impl RustyDeckShell {
             let this = this.clone();
             let ok_form = form.clone();
             let kind_state = form.read(cx).kind.clone();
+            let name_state = form.read(cx).name.clone();
             let left_state = form.read(cx).left.clone();
             let right_state = form.read(cx).right.clone();
             let centre_state = form.read(cx).centre.clone();
@@ -444,7 +461,8 @@ impl RustyDeckShell {
                         .p_2()
                         .child(field("Action", Select::new(&kind_state).placeholder("Choose an action")))
                         .when(is_custom, |body| {
-                            body.child(field("Left", Input::new(&left_state)))
+                            body.child(field("Name", Input::new(&name_state)))
+                                .child(field("Left", Input::new(&left_state)))
                                 .child(field("Right", Input::new(&right_state)))
                                 .child(field("Centre", Input::new(&centre_state)))
                         })
@@ -458,6 +476,7 @@ impl RustyDeckShell {
                 .on_ok(move |_event, _window, cx| {
                     let kind = kind_state.read(cx).selected_value().cloned().unwrap_or(DialKind::None);
                     let commands = DialCommands {
+                        name: name_state.read(cx).value().trim().to_string(),
                         left: left_state.read(cx).value().to_string(),
                         right: right_state.read(cx).value().to_string(),
                         centre: centre_state.read(cx).value().to_string(),
@@ -473,6 +492,8 @@ impl RustyDeckShell {
     fn dial_label(&self, dial: u8) -> SharedString {
         match self.dials.get(dial as usize).and_then(|slot| slot.as_ref()) {
             None => SharedString::from("Unset"),
+            // A name is optional, so an unnamed custom dial keeps the caption it always had.
+            Some(DialConfig::Custom { name, .. }) if !name.is_empty() => SharedString::from(name.clone()),
             Some(DialConfig::Custom { .. }) => SharedString::from("Custom"),
             Some(DialConfig::System { uuid }) => crate::system_actions::CATALOGUE
                 .iter()
@@ -489,12 +510,42 @@ impl RustyDeckShell {
             dial,
             DialKind::None,
             DialCommands {
+                name: String::new(),
                 left: String::new(),
                 right: String::new(),
                 centre: String::new(),
             },
             cx,
         );
+    }
+
+    /// Exchange what two dials do, from dragging one knob onto another.
+    ///
+    /// Always a swap rather than a move: a dial is its position on the device, so the destination's
+    /// config has to go somewhere, and the source is the only knob free to take it. Dropping onto
+    /// an unset dial is how one gets moved.
+    fn swap_dials(&mut self, source: u8, destination: u8, cx: &mut Context<Self>) {
+        if source == destination {
+            return;
+        }
+
+        let Some(device) = self.device.as_ref() else { return };
+        let (id, encoders) = (device.id.clone(), device.encoders as usize);
+
+        cx.spawn(async move |this, cx| {
+            let result = crate::bridge(async move {
+                let mut locks = crate::store::profiles::acquire_locks_mut().await;
+                locks.device_stores.swap_dials(&id, encoders, source, destination)
+            })
+            .await;
+
+            if let Err(error) = result {
+                log::error!("Failed to swap dials {source} and {destination}: {error}");
+                return;
+            }
+            reload_dials(&this, cx).await;
+        })
+        .detach();
     }
 
     /// Save the dial dialog's result to the device's own store.
@@ -506,6 +557,7 @@ impl RustyDeckShell {
             DialKind::None => None,
             DialKind::System(uuid) => Some(DialConfig::System { uuid: uuid.to_string() }),
             DialKind::Custom => Some(DialConfig::Custom {
+                name: commands.name,
                 left: commands.left,
                 right: commands.right,
                 centre: commands.centre,
@@ -1610,6 +1662,21 @@ impl Render for DragPreview {
     }
 }
 
+/// What follows the cursor while a dial is being dragged: the knob itself, captioned as on screen.
+struct DialPreview {
+    label: SharedString,
+}
+
+impl Render for DialPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .items_center()
+            .gap_1()
+            .child(div().size(px(DIAL_SIZE)).rounded_full().bg(cx.theme().accent).border_1().border_color(cx.theme().primary))
+            .child(div().text_xs().text_color(cx.theme().foreground).child(self.label.clone()))
+    }
+}
+
 impl RustyDeckShell {
     /// Device identity, with a swap control for choosing another device.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1895,15 +1962,28 @@ impl RustyDeckShell {
                     .hover(|style| style.bg(cx.theme().accent))
                     .on_click(cx.listener(move |this, _event, window, cx| this.open_dial_dialog(dial, window, cx)));
 
-                // Only a configured dial has anything to clear.
+                // Only a configured dial has anything to clear, or anything to carry elsewhere.
+                // A click and a drag do not conflict: GPUI only starts a drag past its 2px
+                // threshold, so a plain click still opens the dialog.
                 if configured {
-                    knob = knob.on_mouse_down(
-                        gpui::MouseButton::Right,
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.dial_menu_open = Some(dial);
-                            cx.notify();
-                        }),
-                    );
+                    knob = knob
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.dial_menu_open = Some(dial);
+                                cx.notify();
+                            }),
+                        )
+                        .on_drag(
+                            DraggedDial {
+                                dial,
+                                label: label.clone(),
+                            },
+                            |dragged, _cursor_offset, _window, cx| {
+                                let label = dragged.label.clone();
+                                cx.new(|_| DialPreview { label })
+                            },
+                        );
                 }
 
                 v_flex()
@@ -1911,6 +1991,13 @@ impl RustyDeckShell {
                     .w(px(segment_width))
                     .items_center()
                     .gap_1()
+                    .rounded_md()
+                    // The drop lands anywhere in the dial's column rather than only on the knob:
+                    // a 44px circle is a mean target, and the column maps to one dial unambiguously.
+                    .drag_over::<DraggedDial>(|style, _dragged, _window, cx| style.bg(cx.theme().accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedDial, _window, cx| {
+                        this.swap_dials(dragged.dial, dial, cx);
+                    }))
                     .child(knob)
                     .child(
                         div()
