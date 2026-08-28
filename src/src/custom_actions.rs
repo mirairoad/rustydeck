@@ -111,6 +111,19 @@ impl CustomAction {
 	}
 }
 
+/// Largest source image accepted for an action's artwork.
+///
+/// Compositing decodes the file, resizes it twice and re-encodes both faces; the cost scales with
+/// the source's pixel count, and a photo straight off a camera is big enough to take seconds. The
+/// file size is a cheap proxy for that, checked before anything is decoded.
+pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Whether the file at this path is small enough to composite, and its size.
+pub fn within_size_limit(path: &Path) -> (bool, u64) {
+	let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+	(size <= MAX_IMAGE_BYTES, size)
+}
+
 pub const PICTURE: &str = "picture.png";
 
 /// The same artwork composed for the touch strip's rectangle rather than a square key.
@@ -345,7 +358,8 @@ fn ensure_strip(directory: &Path, config: &CustomActionConfig) {
 		.map(|icon| directory.join(icon))
 		.filter(|path| std::fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false));
 
-	if let Err(error) = compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source.as_deref(), config.background.as_deref())
+	let is_icon = source.as_deref().map(has_transparency).unwrap_or(false);
+	if let Err(error) = compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source.as_deref(), is_icon, config.background.as_deref())
 		.and_then(|canvas| write_picture(canvas, &directory.join(STRIP)))
 	{
 		log::warn!("Failed to compose strip artwork in {}: {error}", directory.display());
@@ -501,7 +515,7 @@ pub fn has_transparency(path: &Path) -> bool {
 /// Taking the shape as a parameter is what lets the touch strip have its own render. The strip is a
 /// 2:1 rectangle, so displaying the square key face there would stretch a photo; cropping a fresh
 /// 2:1 canvas from the original keeps its proportions.
-fn compose_canvas(width: u32, height: u32, file: Option<&Path>, background: Option<&str>) -> Result<RgbaImage> {
+fn compose_canvas(width: u32, height: u32, file: Option<&Path>, is_icon: bool, background: Option<&str>) -> Result<RgbaImage> {
 	let mut canvas = RgbaImage::new(width, height);
 	if let Some(background) = background {
 		let colour = parse_colour(background);
@@ -512,7 +526,7 @@ fn compose_canvas(width: u32, height: u32, file: Option<&Path>, background: Opti
 
 	if let Some(file) = file {
 		// An icon is inset by a tenth so the background reads as a border; a picture fills the face.
-		let (inset, fit) = if has_transparency(file) { (0.1, Fit::Contain) } else { (0.0, Fit::Cover) };
+		let (inset, fit) = if is_icon { (0.1, Fit::Contain) } else { (0.0, Fit::Cover) };
 		let margin_x = (width as f32 * inset).round() as u32;
 		let margin_y = (height as f32 * inset).round() as u32;
 
@@ -561,9 +575,12 @@ fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
 
 	let background = spec.background.as_deref();
 	let source = stored_source.as_deref();
+	// Decided once rather than per face: the check decodes the whole image, and both faces want the
+	// same answer about it.
+	let is_icon = source.map(has_transparency).unwrap_or(false);
 
-	write_picture(compose_canvas(CANVAS, CANVAS, source, background)?, &directory.join(PICTURE))?;
-	write_picture(compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source, background)?, &directory.join(STRIP))?;
+	write_picture(compose_canvas(CANVAS, CANVAS, source, is_icon, background)?, &directory.join(PICTURE))?;
+	write_picture(compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source, is_icon, background)?, &directory.join(STRIP))?;
 
 	Ok(source_name)
 }

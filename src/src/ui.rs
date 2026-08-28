@@ -58,6 +58,30 @@ fn opaque(colour: gpui::Hsla) -> gpui::Hsla {
     gpui::Hsla { a: 1.0, ..colour }
 }
 
+/// Simulated dial rotation. Compiled out of a release build, which has no simulated device.
+fn simulate_rotate(device: &str, dial: u8, ticks: i16) {
+    #[cfg(debug_assertions)]
+    crate::simulator::rotate(device, dial, ticks);
+    #[cfg(not(debug_assertions))]
+    let _ = (device, dial, ticks);
+}
+
+/// Simulated dial press. Compiled out of a release build.
+fn simulate_press(device: &str, dial: u8) {
+    #[cfg(debug_assertions)]
+    crate::simulator::press_dial(device, dial);
+    #[cfg(not(debug_assertions))]
+    let _ = (device, dial);
+}
+
+/// Simulated tap of a strip rectangle. Compiled out of a release build.
+fn simulate_tap(device: &str, position: u8) {
+    #[cfg(debug_assertions)]
+    crate::simulator::tap_strip(device, position);
+    #[cfg(not(debug_assertions))]
+    let _ = (device, position);
+}
+
 /// Whether a device is simulated. Always false in a release build, which has none.
 fn is_simulated(device_id: &str) -> bool {
     #[cfg(debug_assertions)]
@@ -130,6 +154,15 @@ struct ActionForm {
     existing_image: Option<String>,
     /// Id of the action being edited, or `None` when creating.
     editing: Option<String>,
+    /// Why the last pick or save was refused, shown in the dialog.
+    error: Option<SharedString>,
+    /// Whether a save has been attempted, so required fields left blank can be marked.
+    invalid: bool,
+    /// Whether a picked image is still being read, so the form can say so.
+    probing: bool,
+    /// Whether artwork is being composited right now, so the form can say so and refuse a second
+    /// save on top of the first.
+    saving: bool,
 }
 
 impl ActionForm {
@@ -304,6 +337,10 @@ impl RustyDeckShell {
                 image_is_icon: false,
                 existing_image: None,
                 editing: None,
+                error: None,
+                invalid: false,
+                probing: false,
+                saving: false,
             }),
             dial_form,
             dials: Vec::new(),
@@ -528,6 +565,10 @@ impl RustyDeckShell {
                 .update(cx, |state, cx| state.set_value(existing.as_ref().map(|a| a.command().to_owned()).unwrap_or_default(), window, cx));
             form.spec = ImageSpec::default();
             form.editing = existing.as_ref().map(|a| a.slug.clone());
+            form.error = None;
+            form.invalid = false;
+            form.probing = false;
+            form.saving = false;
 
             // Preview against the *source* image, not the composited picture - the latter already
             // has the previous background baked in, which would sit opaquely over a new colour.
@@ -561,6 +602,14 @@ impl RustyDeckShell {
             // compositor applies when writing picture.png.
             let preview_background = background_state.read(cx).value();
             let preview_is_icon = form.read(cx).image_is_icon;
+            let error = form.read(cx).error.clone();
+            let saving = form.read(cx).saving;
+            let probing = form.read(cx).probing;
+            // Only mark a blank field once a save has actually been attempted - a form that opens
+            // covered in red is shouting before the user has done anything wrong.
+            let invalid = form.read(cx).invalid;
+            let name_blank = invalid && name_state.read(cx).value().trim().is_empty();
+            let command_blank = invalid && command_state.read(cx).value().trim().is_empty();
 
             dialog
                 .title(title)
@@ -572,8 +621,8 @@ impl RustyDeckShell {
                     v_flex()
                         .gap_3()
                         .p_2()
-                        .child(field("Name", Input::new(&name_state)))
-                        .child(field("Command", Input::new(&command_state)))
+                        .child(field("Name", Input::new(&name_state).border_color(required(name_blank, cx))))
+                        .child(field("Command", Input::new(&command_state).border_color(required(command_blank, cx))))
                         .child(field("Background", ColorPicker::new(&background_state)))
                         .child(field(
                             "Image",
@@ -611,13 +660,31 @@ impl RustyDeckShell {
                                 .child(Button::new("pick-image").label("Choose image…").on_click(move |_event, _window, cx| {
                                     pick_file(pick_image.clone(), cx);
                                 })),
-                        )),
+                        ))
+                        // Compositing happens on a worker, so say that it is happening rather than
+                        // leaving the dialog looking inert.
+                        .when(probing, |body| {
+                            body.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Reading image…"))
+                        })
+                        .when(saving, |body| {
+                            body.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Composing artwork…"))
+                        })
+                        .children(error.map(|message| div().text_sm().text_color(cx.theme().danger).child(message))),
                 )
                 .on_ok(move |_event, _window, cx| {
                     let name = name_state.read(cx).value().to_string();
                     let command = command_state.read(cx).value().to_string();
                     if name.trim().is_empty() || command.trim().is_empty() {
-                        // Keep the dialog open until both are filled in.
+                        // Keep the dialog open until both are filled in, and mark which.
+                        ok_form.update(cx, |form, cx| {
+                            form.invalid = true;
+                            cx.notify();
+                        });
+                        return false;
+                    }
+                    if ok_form.read(cx).saving {
+                        // A save is already in flight; a second one would race it onto the same
+                        // directory.
                         return false;
                     }
 
@@ -629,32 +696,72 @@ impl RustyDeckShell {
         });
     }
 
+    /// Composite and store an action, then fold the result back into the library.
+    ///
+    /// The compositing runs on a worker: it decodes the source, resizes it twice and re-encodes
+    /// both faces, which on a large photo is seconds of work. Doing that inline froze the window
+    /// until it finished - and because nothing else could run in the meantime, the form appeared to
+    /// accept only one action per launch.
     fn save_custom_action(&mut self, name: String, command: String, spec: ImageSpec, editing: Option<String>, cx: &mut Context<Self>) {
-        let result = match &editing {
-            Some(id) => custom_actions::update(id, name, command, &spec).inspect(|updated| {
-                // An edit can rename the directory, so match on the id we edited, not the new one.
-                match self.custom.iter_mut().find(|action| action.slug == *id) {
-                    Some(existing) => *existing = updated.clone(),
-                    None => self.custom.push(updated.clone()),
+        let form = self.form.clone();
+        form.update(cx, |form, cx| {
+            form.saving = true;
+            form.error = None;
+            cx.notify();
+        });
+
+        cx.spawn(async move |this, cx| {
+            let edited = editing.clone();
+            let result = crate::bridge(async move {
+                tokio::task::spawn_blocking(move || match &editing {
+                    Some(id) => custom_actions::update(id, name, command, &spec),
+                    None => custom_actions::create(name, command, &spec),
+                })
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("compositing panicked: {error}")))
+            })
+            .await;
+
+            let _ = form.update(cx, |form, cx| {
+                form.saving = false;
+                if let Err(error) = &result {
+                    form.error = Some(SharedString::from(format!("Could not save: {error}")));
                 }
-            }),
-            None => custom_actions::create(name, command, &spec).inspect(|action| self.custom.push(action.clone())),
-        };
+                cx.notify();
+            });
 
-        match result {
-            // Artwork is rewritten to the same `picture.png` path, so GPUI would keep serving the
-            // bitmap it decoded earlier - evict it, or the sidebar and any slot already using this
-            // action keep showing the old picture.
-            Ok(action) => {
-                let source: gpui::ImageSource = action.image_path().into();
-                source.remove_asset(cx);
+            let action = match result {
+                Ok(action) => action,
+                Err(error) => {
+                    log::error!("Failed to save custom action: {error}");
+                    return;
+                }
+            };
 
-                // Slots already carrying this action need re-pushing so the hardware follows too.
-                cx.spawn(async move |this, cx| reload_profile(&this, cx).await).detach();
-            }
-            Err(error) => log::error!("Failed to save custom action: {error}"),
-        }
-        cx.notify();
+            let _ = this.update(cx, |this, cx| {
+                match &edited {
+                    // An edit can rename the directory, so match on the id we edited, not the new one.
+                    Some(id) => match this.custom.iter_mut().find(|candidate| candidate.slug == *id) {
+                        Some(existing) => *existing = action.clone(),
+                        None => this.custom.push(action.clone()),
+                    },
+                    None => this.custom.push(action.clone()),
+                }
+
+                // Artwork is rewritten to the same `picture.png` path, so GPUI would keep serving
+                // the bitmap it decoded earlier - evict it, or the sidebar and any slot already
+                // using this action keep showing the old picture.
+                for path in [action.image_path(), action.strip_path()] {
+                    let source: gpui::ImageSource = path.into();
+                    source.remove_asset(cx);
+                }
+                cx.notify();
+            });
+
+            // Slots already carrying this action need re-pushing so the hardware follows too.
+            reload_profile(&this, cx).await;
+        })
+        .detach();
     }
 
     /// Place a custom action on a slot: create the Run Command instance that backs it, then write
@@ -745,7 +852,7 @@ impl RustyDeckShell {
                 cx.notify();
             });
             reload_dials(&this, cx).await;
-            push_device_images(device, profile).await;
+            push_device_images(device, profile);
         })
         .detach();
     }
@@ -835,12 +942,11 @@ impl RustyDeckShell {
             // A strip segment is the exception: its gesture is a tap, not a press, so on a
             // simulated device it goes in through the touchscreen path instead.
             let press_context = context.clone();
-            let simulate_tap = is_simulated(&device.id) && controller == ENCODER_CONTROLLER;
+            let tap_instead_of_press = is_simulated(&device.id) && controller == ENCODER_CONTROLLER;
             cell = cell.on_click(move |_event, _window, cx| {
                 let context = press_context.clone();
-                if simulate_tap {
-                    #[cfg(debug_assertions)]
-                    crate::simulator::tap_strip(&context.device, context.position);
+                if tap_instead_of_press {
+                    simulate_tap(&context.device, context.position);
                     return;
                 }
                 cx.background_spawn(async move {
@@ -937,7 +1043,16 @@ impl RustyDeckShell {
 /// The backend never renders images itself (see `device_render`), so nothing reaches the hardware
 /// unless the shell does this - on load and after every mutation, mirroring how the old frontend
 /// re-rendered each slot's canvas whenever it re-rendered the grid.
-async fn push_device_images(device: DeviceInfo, profile: Profile) {
+/// Composite every slot at the device's own resolution and push it to the hardware.
+///
+/// Runs on the Tokio runtime rather than being awaited on the window's executor: this decodes,
+/// composites and JPEG-encodes once per slot, which on a profile full of artwork is long enough to
+/// stall the window - it was why the palette took a moment to catch up after saving an action.
+fn push_device_images(device: DeviceInfo, profile: Profile) {
+    crate::spawn(push_device_images_now(device, profile));
+}
+
+async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
     // Touchpoints live in the keypad array, appended after the keys.
     let keypad_count = (device.rows as usize) * (device.columns as usize) + device.touchpoints as usize;
 
@@ -960,20 +1075,29 @@ async fn push_device_images(device: DeviceInfo, profile: Profile) {
 
             let image = match slots[position].as_ref() {
                 Some(instance) => match instance.states.get(instance.current_state as usize) {
-                    Some(state) => match render_state(state, width, height) {
-                        Ok(image) => Some(image),
-                        Err(error) => {
-                            log::warn!("Failed to render image for {controller} slot {position}: {error}");
-                            continue;
+                    Some(state) => {
+                        // Compositing is CPU work, so it goes to a blocking worker rather than
+                        // holding a runtime thread.
+                        let state = state.clone();
+                        match tokio::task::spawn_blocking(move || render_state(&state, width, height)).await {
+                            Ok(Ok(image)) => Some(image),
+                            Ok(Err(error)) => {
+                                log::warn!("Failed to render image for {controller} slot {position}: {error}");
+                                continue;
+                            }
+                            Err(error) => {
+                                log::warn!("Rendering panicked for {controller} slot {position}: {error}");
+                                continue;
+                            }
                         }
-                    },
+                    }
                     None => None,
                 },
                 // `None` clears the slot on the device.
                 None => None,
             };
 
-            crate::bridge(frontend::instances::update_image(context, image)).await;
+            frontend::instances::update_image(context, image).await;
         }
     }
 }
@@ -1040,7 +1164,7 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
         cx.notify();
     });
 
-    push_device_images(device, profile).await;
+    push_device_images(device, profile);
 }
 
 /// Re-apply the current definition of any custom action that a slot was created from.
@@ -1183,6 +1307,12 @@ enum PageAction {
     Remove,
 }
 
+/// The border a required field should wear: red when it has been left blank, otherwise the input's
+/// ordinary one.
+fn required(blank: bool, cx: &App) -> gpui::Hsla {
+    if blank { cx.theme().danger } else { cx.theme().input }
+}
+
 /// A labelled form field in the create dialog.
 fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
     v_flex().gap_1().child(div().text_sm().child(label)).child(control)
@@ -1201,11 +1331,46 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
         };
         let path = handle.path().to_path_buf();
 
-        let is_icon = custom_actions::has_transparency(&path);
+        // Refuse before decoding anything: an oversized source is exactly the case that used to
+        // wedge the window for seconds while it was composited.
+        let (within_limit, size) = custom_actions::within_size_limit(&path);
+        if !within_limit {
+            let message = SharedString::from(format!(
+                "That image is {:.1} MB. The limit is {} MB - resize it and try again.",
+                size as f64 / (1024.0 * 1024.0),
+                custom_actions::MAX_IMAGE_BYTES / (1024 * 1024),
+            ));
+            let _ = form.update(cx, |form, cx| {
+                form.error = Some(message);
+                form.probing = false;
+                cx.notify();
+            });
+            return;
+        }
+
+        // Deciding icon-vs-photo decodes the file and scans every pixel, so it belongs on a worker
+        // rather than the thread painting the window. It still takes a moment on a large photo, so
+        // say so.
+        let _ = form.update(cx, |form, cx| {
+            form.probing = true;
+            form.error = None;
+            cx.notify();
+        });
+
+        let probe = path.clone();
+        let is_icon = crate::bridge(async move {
+            tokio::task::spawn_blocking(move || custom_actions::has_transparency(&probe))
+                .await
+                .unwrap_or(false)
+        })
+        .await;
+
         let _ = form.update(cx, |form, cx| {
             form.spec.file = Some(path);
             form.image_is_icon = is_icon;
             form.existing_image = None;
+            form.error = None;
+            form.probing = false;
             cx.notify();
         });
     })
@@ -1405,67 +1570,76 @@ impl RustyDeckShell {
         };
 
         let picker = self.device_picker_open.then(|| {
-            v_flex()
-                .absolute()
-                .top(px(44.0))
-                .right_0()
-                .w(px(240.0))
-                .p_1()
-                .gap_1()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(opaque(cx.theme().background))
-                .shadow_lg()
-                .children({
-                    // Real hardware first, then the simulated models under a heading, so a fake
-                    // deck is never mistaken for something that is actually plugged in.
-                    let mut devices: Vec<DeviceInfo> = self.devices.iter().cloned().collect();
-                    devices.sort_by_key(|device| (is_simulated(&device.id), device.name.clone()));
-                    let first_simulated = devices.iter().position(|device| is_simulated(&device.id));
+            // `deferred` paints this after the rest of the tree, so it sits above the device slots
+            // instead of sliding behind them when the window is small enough for them to overlap;
+            // `occlude` stops a click passing through to whatever is underneath. The same pairing
+            // the row and slot menus use.
+            deferred(
+                v_flex()
+                    .occlude()
+                    .absolute()
+                    // Held off the window edge rather than flush against it.
+                    .top(px(49.0))
+                    .right(px(5.0))
+                    .w(px(240.0))
+                    .p_1()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(opaque(cx.theme().background))
+                    .shadow_lg()
+                    .children({
+                        // Real hardware first, then the simulated models under a heading, so a fake
+                        // deck is never mistaken for something that is actually plugged in.
+                        let mut devices: Vec<DeviceInfo> = self.devices.iter().cloned().collect();
+                        devices.sort_by_key(|device| (is_simulated(&device.id), device.name.clone()));
+                        let first_simulated = devices.iter().position(|device| is_simulated(&device.id));
 
-                    let mut rows = Vec::with_capacity(devices.len());
-                    for (index, device) in devices.into_iter().enumerate() {
-                        let simulated = is_simulated(&device.id);
-                        let selected = self.device.as_ref().is_some_and(|current| current.id == device.id);
-                        let label = SharedString::from(device.name.clone());
+                        let mut rows = Vec::with_capacity(devices.len());
+                        for (index, device) in devices.into_iter().enumerate() {
+                            let simulated = is_simulated(&device.id);
+                            let selected = self.device.as_ref().is_some_and(|current| current.id == device.id);
+                            let label = SharedString::from(device.name.clone());
 
-                        rows.push(
-                            v_flex()
-                                .w_full()
-                                // The divider carries the heading, so it only shows when there is
-                                // real hardware above it to divide from.
-                                .when(first_simulated == Some(index) && index > 0, |column| {
-                                    column.child(
-                                        div()
+                            rows.push(
+                                v_flex()
+                                    .w_full()
+                                    // The divider carries the heading, so it only shows when there is
+                                    // real hardware above it to divide from.
+                                    .when(first_simulated == Some(index) && index > 0, |column| {
+                                        column.child(
+                                            div()
+                                                .w_full()
+                                                .mt_1()
+                                                .pt_1()
+                                                .px_2()
+                                                .border_t_1()
+                                                .border_color(cx.theme().border)
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Simulated"),
+                                        )
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .id(SharedString::from(device.id.clone()))
                                             .w_full()
-                                            .mt_1()
-                                            .pt_1()
-                                            .px_2()
-                                            .border_t_1()
-                                            .border_color(cx.theme().border)
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Simulated"),
-                                    )
-                                })
-                                .child(
-                                    h_flex()
-                                        .id(SharedString::from(device.id.clone()))
-                                        .w_full()
-                                        .p_2()
-                                        .rounded_md()
-                                        .text_sm()
-                                        .when(simulated, |row| row.bg(rgb(SIMULATED_TINT)))
-                                        .when(selected, |row| row.bg(cx.theme().accent))
-                                        .hover(|style| style.bg(cx.theme().accent))
-                                        .child(label)
-                                        .on_click(cx.listener(move |this, _event, _window, cx| this.select_device(device.clone(), cx))),
-                                ),
-                        );
-                    }
-                    rows
-                })
+                                            .p_2()
+                                            .rounded_md()
+                                            .text_sm()
+                                            .when(simulated, |row| row.bg(rgb(SIMULATED_TINT)))
+                                            .when(selected, |row| row.bg(cx.theme().accent))
+                                            .hover(|style| style.bg(cx.theme().accent))
+                                            .child(label)
+                                            .on_click(cx.listener(move |this, _event, _window, cx| this.select_device(device.clone(), cx))),
+                                    ),
+                            );
+                        }
+                        rows
+                    })
+            )
+            .with_priority(1)
         });
 
         h_flex()
@@ -1708,10 +1882,7 @@ impl RustyDeckShell {
                                 .bg(rgb(SIMULATED_TINT))
                                 .hover(|style| style.opacity(0.8))
                                 .child(glyph)
-                                .on_click(move |_event, _window, _cx| {
-                                    #[cfg(debug_assertions)]
-                                    crate::simulator::rotate(&device, dial, ticks);
-                                })
+                                .on_click(move |_event, _window, _cx| simulate_rotate(&device, dial, ticks))
                         };
 
                         let press_device = device_id.clone();
@@ -1728,10 +1899,7 @@ impl RustyDeckShell {
                                         .bg(rgb(SIMULATED_TINT))
                                         .hover(|style| style.opacity(0.8))
                                         .child("●")
-                                        .on_click(move |_event, _window, _cx| {
-                                            #[cfg(debug_assertions)]
-                                            crate::simulator::press_dial(&press_device, dial);
-                                        }),
+                                        .on_click(move |_event, _window, _cx| simulate_press(&press_device, dial)),
                                 )
                                 .child(turn("dial-right", "▶", 1)),
                         )
