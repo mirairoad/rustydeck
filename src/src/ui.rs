@@ -1053,6 +1053,7 @@ fn push_device_images(device: DeviceInfo, profile: Profile) {
 }
 
 async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
+    let _timed = crate::shared::Timed::start("push_device_images (all slots)");
     // Touchpoints live in the keypad array, appended after the keys.
     let keypad_count = (device.rows as usize) * (device.columns as usize) + device.touchpoints as usize;
 
@@ -1132,6 +1133,7 @@ async fn reload_dials(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp
 }
 
 async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
+    let _timed = crate::shared::Timed::start("reload_profile");
     let Some(device) = this.update(cx, |this, _| this.device.clone()).ok().flatten() else {
         return;
     };
@@ -1174,6 +1176,7 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
 /// silently drifting from the library.
 /// Returns whether anything was changed, so the caller knows to re-read the profile.
 async fn sync_custom_instances(device: &DeviceInfo, profile: &Profile) -> bool {
+    let _timed = crate::shared::Timed::start("sync_custom_instances");
     let mut library = custom_actions::load();
     library.extend(custom_actions::load_predefined());
     if library.is_empty() {
@@ -1331,14 +1334,13 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
         };
         let path = handle.path().to_path_buf();
 
-        // Refuse before decoding anything: an oversized source is exactly the case that used to
-        // wedge the window for seconds while it was composited.
-        let (within_limit, size) = custom_actions::within_size_limit(&path);
+        // Refuse before decoding anything, on the axis that actually costs time. The header gives
+        // the dimensions without touching the pixels.
+        let (within_limit, megapixels) = custom_actions::within_pixel_limit(&path);
         if !within_limit {
             let message = SharedString::from(format!(
-                "That image is {:.1} MB. The limit is {} MB - resize it and try again.",
-                size as f64 / (1024.0 * 1024.0),
-                custom_actions::MAX_IMAGE_BYTES / (1024 * 1024),
+                "That image is {megapixels:.0} megapixels. The limit is {:.0} - resize it and try again.",
+                custom_actions::MAX_MEGAPIXELS,
             ));
             let _ = form.update(cx, |form, cx| {
                 form.error = Some(message);

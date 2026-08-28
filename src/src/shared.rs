@@ -45,6 +45,35 @@ pub const VOLUME_UUID: &str = "rustydeck.volume";
 pub const MIC_UUID: &str = "rustydeck.mic";
 pub const DISPLAY_BRIGHTNESS_UUID: &str = "rustydeck.displaybrightness";
 
+/// Logs how long a step took, from construction to drop.
+///
+/// Debug builds only - the release build keeps the timing but never logs it, so instrumenting a hot
+/// path costs an `Instant::now` and nothing else.
+///
+/// ```ignore
+/// let _t = Timed::start("compose square");
+/// ```
+pub struct Timed {
+	label: std::borrow::Cow<'static, str>,
+	start: std::time::Instant,
+}
+
+impl Timed {
+	pub fn start(label: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+		Self {
+			label: label.into(),
+			start: std::time::Instant::now(),
+		}
+	}
+}
+
+impl Drop for Timed {
+	fn drop(&mut self) {
+		#[cfg(debug_assertions)]
+		log::info!("[timing] {} took {:.1?}", self.label, self.start.elapsed());
+	}
+}
+
 pub fn copy_dir(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), std::io::Error> {
 	use std::fs;
 	fs::create_dir_all(&dst)?;
