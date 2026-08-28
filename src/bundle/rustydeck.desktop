@@ -1,8 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=RustyDeck
-Comment={{comment}}
-Exec={{exec}}
-Icon={{icon}}
+Comment=Control an Elgato Stream Deck
+Exec=rustydeck
+Icon=rustydeck
 Terminal=false
-Categories={{categories}}
+Categories=Utility;
+Keywords=streamdeck;elgato;macro;
+StartupWMClass=rustydeck
