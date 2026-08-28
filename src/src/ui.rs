@@ -78,14 +78,6 @@ fn simulate_press(device: &str, dial: u8) {
     let _ = (device, dial);
 }
 
-/// Simulated tap of a strip rectangle. Compiled out of a release build.
-fn simulate_tap(device: &str, position: u8) {
-    #[cfg(debug_assertions)]
-    crate::simulator::tap_strip(device, position);
-    #[cfg(not(debug_assertions))]
-    let _ = (device, position);
-}
-
 /// Whether a device is simulated. Always false in a release build, which has none.
 fn is_simulated(device_id: &str) -> bool {
     #[cfg(debug_assertions)]
@@ -946,22 +938,24 @@ impl RustyDeckShell {
                 cell = cell.child(img(resolve_image_path(&path)).size_full().object_fit(gpui::ObjectFit::Fill));
             }
 
-            // Clicking a filled slot runs it, exactly as pressing the physical key would -
-            // `trigger_virtual_press` drives the same key-down/up path the hardware does.
+            // Clicking a filled slot runs it, exactly as using the physical control would -
+            // both of these drive the same entry points the driver does.
             // A click and a drag do not conflict: GPUI only starts a drag past its 2px threshold.
             //
-            // A strip segment is the exception: its gesture is a tap, not a press, so on a
-            // simulated device it goes in through the touchscreen path instead.
+            // A strip segment's gesture is a tap, not a press, on every device rather than only a
+            // simulated one: the rectangle owns the tap command and the dial beneath it owns the
+            // press, so sending the click down the press path runs the dial's command instead.
             let press_context = context.clone();
-            let tap_instead_of_press = is_simulated(&device.id) && controller == ENCODER_CONTROLLER;
+            let taps = controller == ENCODER_CONTROLLER;
             cell = cell.on_click(move |_event, _window, cx| {
                 let context = press_context.clone();
-                if tap_instead_of_press {
-                    simulate_tap(&context.device, context.position);
-                    return;
-                }
                 cx.background_spawn(async move {
-                    if let Err(error) = crate::bridge(frontend::instances::trigger_virtual_press(context)).await {
+                    let result = if taps {
+                        crate::bridge(frontend::instances::trigger_virtual_tap(context)).await
+                    } else {
+                        crate::bridge(frontend::instances::trigger_virtual_press(context)).await
+                    };
+                    if let Err(error) = result {
                         log::error!("Failed to trigger action: {error}");
                     }
                 })
