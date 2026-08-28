@@ -76,6 +76,25 @@ Configuration lives in `~/.rustydeck`: `profiles/` (one file per device plus a
 directory of pages), `customs/` and `predefined/` (action libraries, each action
 a directory with its config and artwork), and `settings.json`.
 
+## Backup and restore
+
+The two arrows in the header back the configuration up and put it back.
+
+**Export** writes a zip named `rustydeck_DDMMYY_XXXXXXXX.zip` holding the action
+library and its artwork, every device's dials, pages and selected profile, and
+`settings.json`. Logs are left out, being neither small nor configuration.
+
+**Restore** replaces all of that with what the archive holds - it is a restore,
+not a merge, and it asks before doing anything. The configuration it replaces is
+moved to `~/.rustydeck.replaced-<timestamp>` rather than deleted, and the dialog
+says where, so restoring the wrong file is one `mv` away from being undone.
+
+The swap goes through a staging directory beside the configuration root:
+extraction is not atomic and can fail halfway, so doing it to one side means a
+failure leaves the existing setup untouched. An archive that is not a RustyDeck
+backup, or that contains a path climbing out of the directory, is refused before
+anything moves.
+
 ## The simulator
 
 Debug builds register a simulated deck for every model - Mini, Stream Deck,

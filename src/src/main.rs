@@ -1,4 +1,5 @@
 mod application_watcher;
+mod backup;
 mod custom_actions;
 mod device_render;
 mod device_sleep;

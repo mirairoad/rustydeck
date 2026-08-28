@@ -16,6 +16,14 @@ pub struct ProfileStores {
 }
 
 impl ProfileStores {
+	/// Forget every cached profile, so the next read comes from disk.
+	///
+	/// For a restore: these hold the configuration that has just been replaced, and saving one
+	/// would write it back over the restored file.
+	pub fn clear(&mut self) {
+		self.stores.clear();
+	}
+
 	fn canonical_id(device: &str, id: &str) -> String {
 		if cfg!(target_os = "windows") {
 			PathBuf::from(device).join(id.replace('/', "\\")).to_str().unwrap().to_owned()
@@ -237,6 +245,11 @@ pub struct DeviceStores {
 }
 
 impl DeviceStores {
+	/// Forget every cached device configuration - see [`ProfileStores::clear`].
+	pub fn clear(&mut self) {
+		self.stores.clear();
+	}
+
 	pub fn get_selected_profile(&mut self, device: &str) -> Result<String, anyhow::Error> {
 		if !self.stores.contains_key(device) {
 			let default = DeviceConfig::default();

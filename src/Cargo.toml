@@ -45,6 +45,7 @@ ab_glyph = "0.2"
 resvg = "0.45"
 chrono = "0.4"
 psp = { git = "https://github.com/pewsheen/psp", rev = "d2936425122e26822a2c126e958ca966cac82b3c" }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

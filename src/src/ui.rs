@@ -651,6 +651,127 @@ impl RustyDeckShell {
         .detach();
     }
 
+    /// A one-message dialog, for reporting something that finished without one.
+    fn notice(&self, title: &'static str, message: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let message = message.clone();
+            dialog
+                .title(title)
+                .button_props(DialogButtonProps::default().ok_text("OK"))
+                // Footer buttons only render when a footer is set - see `open_action_dialog`.
+                .footer(|ok, _cancel, window, cx| vec![ok(window, cx)])
+                .child(div().p_2().text_sm().text_color(cx.theme().foreground).child(message))
+        });
+    }
+
+    /// Write every part of the configuration to a zip the user names.
+    fn export_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_file_name(crate::backup::archive_name())
+                .add_filter("Backup", &["zip"])
+                .save_file()
+                .await
+            else {
+                return;
+            };
+
+            let destination = handle.path().to_path_buf();
+            let result = crate::bridge(crate::backup::export(destination.clone())).await;
+
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => this.notice("Backup saved", SharedString::from(format!("Saved to {}", destination.display())), window, cx),
+                Err(error) => this.notice("Backup failed", SharedString::from(error.to_string()), window, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Pick a backup to restore from, then ask before replacing anything.
+    fn choose_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let Some(handle) = rfd::AsyncFileDialog::new().add_filter("Backup", &["zip"]).pick_file().await else {
+                return;
+            };
+
+            let archive = handle.path().to_path_buf();
+            let _ = this.update_in(cx, |this, window, cx| this.confirm_restore(archive, window, cx));
+        })
+        .detach();
+    }
+
+    /// Confirm a restore before it happens.
+    ///
+    /// This replaces the whole configuration rather than merging into it, which is not something to
+    /// discover afterwards - so it is spelled out, and the button says what it does.
+    fn confirm_restore(&mut self, archive: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let name = SharedString::from(archive.file_name().unwrap_or_default().to_string_lossy().into_owned());
+
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let this = this.clone();
+            let archive = archive.clone();
+            let name = name.clone();
+
+            dialog
+                .title("Restore from backup")
+                .button_props(DialogButtonProps::default().ok_text("Replace everything").cancel_text("Cancel"))
+                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .p_2()
+                        .child(div().text_sm().text_color(cx.theme().foreground).child(name))
+                        .child(div().text_sm().text_color(cx.theme().muted_foreground).child(
+                            "Every action, image, dial and page is replaced by what this backup holds. Your current configuration is moved aside, not deleted - the restore will say where.",
+                        )),
+                )
+                .on_ok(move |_event, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.run_restore(archive.clone(), window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Replace the configuration, then rebuild everything on screen from what landed on disk.
+    fn run_restore(&mut self, archive: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let result = crate::bridge(crate::backup::restore(archive)).await;
+
+            let aside = match result {
+                Ok(aside) => aside,
+                Err(error) => {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.notice("Restore failed", SharedString::from(error.to_string()), window, cx);
+                    });
+                    return;
+                }
+            };
+
+            // The stores were dropped as part of the swap, so everything held here is now stale:
+            // the library, the catalogue, the visible profile, the dials, and the artwork on the
+            // deck itself. Rebuild all of it from the restored files.
+            let _ = this.update(cx, |this, cx| {
+                this.custom = custom_actions::load();
+                this.predefined = custom_actions::load_predefined();
+                cx.notify();
+            });
+            refresh_catalogue(&this, cx).await;
+            reload_profile(&this, cx).await;
+            reload_dials(&this, cx).await;
+
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.notice(
+                    "Restored",
+                    SharedString::from(format!("Your previous configuration was moved to {}", aside.display())),
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
     /// Run a custom action's command directly, without going through the deck.
     fn execute_command(&mut self, command: String, cx: &mut Context<Self>) {
         self.row_menu_open = None;
@@ -1868,14 +1989,31 @@ impl RustyDeckShell {
             .bg(cx.theme().background)
             .child(div().text_xl().font_semibold().text_color(cx.theme().foreground).child(title))
             .child(
-                div().relative().child(
-                    Button::new("swap-device")
-                        .icon(IconName::Replace)
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.device_picker_open = !this.device_picker_open;
-                            cx.notify();
-                        })),
-                ),
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    // Restore reads a backup in; export writes one out. Arrows rather than the
+                    // tray icons, because the pair has to read as opposite directions at 16px.
+                    .child(
+                        Button::new("restore-backup")
+                            .icon(IconName::ArrowUp)
+                            .on_click(cx.listener(|this, _event, window, cx| this.choose_backup(window, cx))),
+                    )
+                    .child(
+                        Button::new("export-backup")
+                            .icon(IconName::ArrowDown)
+                            .on_click(cx.listener(|this, _event, window, cx| this.export_backup(window, cx))),
+                    )
+                    .child(
+                        div().relative().child(
+                            Button::new("swap-device")
+                                .icon(IconName::Replace)
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.device_picker_open = !this.device_picker_open;
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
             )
             .children(picker)
     }
