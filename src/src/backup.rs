@@ -23,6 +23,16 @@ use zip::{ZipArchive, ZipWriter};
 /// nothing reads any more; a backup taken now should not carry it into the future.
 const CONTENTS: &[&str] = &["customs", "predefined", "profiles", "images", "settings.json"];
 
+/// What a replaced configuration is renamed to, before its timestamp.
+const REPLACED_PREFIX: &str = ".rustydeck.replaced-";
+
+/// How many replaced configurations to keep.
+///
+/// Each is a full copy of everything, artwork included, so they are not small. Moving one aside is
+/// there to make a mistaken restore recoverable, and that only needs the last one or two - keeping
+/// every restore ever made just fills the home directory.
+const KEEP_REPLACED: usize = 2;
+
 /// Eight well-mixed characters, to stop two backups taken on the same day from colliding.
 ///
 /// No RNG crate is in the tree and none is warranted for this: nanosecond time through a xorshift
@@ -106,6 +116,40 @@ fn write_archive(destination: &Path) -> Result<()> {
 	Ok(())
 }
 
+/// The timestamp format a replaced configuration is stamped with.
+const REPLACED_STAMP: &str = "%Y%m%d-%H%M%S";
+
+/// Delete all but the most recent [`KEEP_REPLACED`] configurations moved aside by earlier restores.
+///
+/// A directory only counts if its suffix parses as one of our timestamps. Matching on the prefix
+/// alone would be enough to *find* them, but this decides what to hand to `remove_dir_all`: sorting
+/// names lexically lets anything that merely looks similar sort above a real one and displace it,
+/// and a directory we cannot account for is not one to delete.
+fn prune_replaced(parent: &Path) {
+	let Ok(entries) = std::fs::read_dir(parent) else { return };
+
+	let mut replaced: Vec<(chrono::NaiveDateTime, PathBuf)> = entries
+		.flatten()
+		.map(|entry| entry.path())
+		.filter(|path| path.is_dir())
+		.filter_map(|path| {
+			let name = path.file_name()?.to_string_lossy().into_owned();
+			let stamp = name.strip_prefix(REPLACED_PREFIX)?;
+			let stamp = chrono::NaiveDateTime::parse_from_str(stamp, REPLACED_STAMP).ok()?;
+			Some((stamp, path))
+		})
+		.collect();
+
+	replaced.sort_by_key(|(stamp, _)| *stamp);
+
+	let Some(surplus) = replaced.len().checked_sub(KEEP_REPLACED) else { return };
+	for (_, path) in replaced.into_iter().take(surplus) {
+		if let Err(error) = std::fs::remove_dir_all(&path) {
+			log::warn!("Failed to prune {}: {error}", path.display());
+		}
+	}
+}
+
 /// Refuse an archive that is not one of ours, before anything on disk is moved.
 fn validate<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<()> {
 	let mut recognised = false;
@@ -150,7 +194,7 @@ fn replace_from_archive(archive: &Path) -> Result<PathBuf> {
 	let _ = std::fs::remove_dir_all(&staging);
 	zip.extract(&staging).context("extracting the archive")?;
 
-	let aside = parent.join(format!(".rustydeck.replaced-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+	let aside = parent.join(format!("{REPLACED_PREFIX}{}", chrono::Local::now().format(REPLACED_STAMP)));
 	if root.exists() {
 		std::fs::rename(&root, &aside).with_context(|| format!("moving {} aside", root.display()))?;
 	}
@@ -167,6 +211,9 @@ fn replace_from_archive(archive: &Path) -> Result<PathBuf> {
 	// only ever a path to resolve against, and `logs/` holds nothing worth backing up. Recreate the
 	// standard tree so nothing later trips over a directory that is simply missing.
 	crate::shared::initialise_config_dir();
+
+	// Only now that the new tree is in place, so a failure above never costs the older copies.
+	prune_replaced(&parent);
 
 	Ok(aside)
 }
