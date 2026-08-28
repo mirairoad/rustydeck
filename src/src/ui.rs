@@ -156,6 +156,10 @@ struct ActionForm {
     editing: Option<String>,
     /// Why the last pick or save was refused, shown in the dialog.
     error: Option<SharedString>,
+    /// Whether a save has been attempted, so required fields left blank can be marked.
+    invalid: bool,
+    /// Whether a picked image is still being read, so the form can say so.
+    probing: bool,
     /// Whether artwork is being composited right now, so the form can say so and refuse a second
     /// save on top of the first.
     saving: bool,
@@ -334,6 +338,8 @@ impl RustyDeckShell {
                 existing_image: None,
                 editing: None,
                 error: None,
+                invalid: false,
+                probing: false,
                 saving: false,
             }),
             dial_form,
@@ -560,6 +566,8 @@ impl RustyDeckShell {
             form.spec = ImageSpec::default();
             form.editing = existing.as_ref().map(|a| a.slug.clone());
             form.error = None;
+            form.invalid = false;
+            form.probing = false;
             form.saving = false;
 
             // Preview against the *source* image, not the composited picture - the latter already
@@ -596,6 +604,12 @@ impl RustyDeckShell {
             let preview_is_icon = form.read(cx).image_is_icon;
             let error = form.read(cx).error.clone();
             let saving = form.read(cx).saving;
+            let probing = form.read(cx).probing;
+            // Only mark a blank field once a save has actually been attempted - a form that opens
+            // covered in red is shouting before the user has done anything wrong.
+            let invalid = form.read(cx).invalid;
+            let name_blank = invalid && name_state.read(cx).value().trim().is_empty();
+            let command_blank = invalid && command_state.read(cx).value().trim().is_empty();
 
             dialog
                 .title(title)
@@ -607,8 +621,8 @@ impl RustyDeckShell {
                     v_flex()
                         .gap_3()
                         .p_2()
-                        .child(field("Name", Input::new(&name_state)))
-                        .child(field("Command", Input::new(&command_state)))
+                        .child(field("Name", Input::new(&name_state).border_color(required(name_blank, cx))))
+                        .child(field("Command", Input::new(&command_state).border_color(required(command_blank, cx))))
                         .child(field("Background", ColorPicker::new(&background_state)))
                         .child(field(
                             "Image",
@@ -649,6 +663,9 @@ impl RustyDeckShell {
                         ))
                         // Compositing happens on a worker, so say that it is happening rather than
                         // leaving the dialog looking inert.
+                        .when(probing, |body| {
+                            body.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Reading image…"))
+                        })
                         .when(saving, |body| {
                             body.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Composing artwork…"))
                         })
@@ -658,7 +675,11 @@ impl RustyDeckShell {
                     let name = name_state.read(cx).value().to_string();
                     let command = command_state.read(cx).value().to_string();
                     if name.trim().is_empty() || command.trim().is_empty() {
-                        // Keep the dialog open until both are filled in.
+                        // Keep the dialog open until both are filled in, and mark which.
+                        ok_form.update(cx, |form, cx| {
+                            form.invalid = true;
+                            cx.notify();
+                        });
                         return false;
                     }
                     if ok_form.read(cx).saving {
@@ -831,7 +852,7 @@ impl RustyDeckShell {
                 cx.notify();
             });
             reload_dials(&this, cx).await;
-            push_device_images(device, profile).await;
+            push_device_images(device, profile);
         })
         .detach();
     }
@@ -1022,7 +1043,16 @@ impl RustyDeckShell {
 /// The backend never renders images itself (see `device_render`), so nothing reaches the hardware
 /// unless the shell does this - on load and after every mutation, mirroring how the old frontend
 /// re-rendered each slot's canvas whenever it re-rendered the grid.
-async fn push_device_images(device: DeviceInfo, profile: Profile) {
+/// Composite every slot at the device's own resolution and push it to the hardware.
+///
+/// Runs on the Tokio runtime rather than being awaited on the window's executor: this decodes,
+/// composites and JPEG-encodes once per slot, which on a profile full of artwork is long enough to
+/// stall the window - it was why the palette took a moment to catch up after saving an action.
+fn push_device_images(device: DeviceInfo, profile: Profile) {
+    crate::spawn(push_device_images_now(device, profile));
+}
+
+async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
     // Touchpoints live in the keypad array, appended after the keys.
     let keypad_count = (device.rows as usize) * (device.columns as usize) + device.touchpoints as usize;
 
@@ -1045,20 +1075,29 @@ async fn push_device_images(device: DeviceInfo, profile: Profile) {
 
             let image = match slots[position].as_ref() {
                 Some(instance) => match instance.states.get(instance.current_state as usize) {
-                    Some(state) => match render_state(state, width, height) {
-                        Ok(image) => Some(image),
-                        Err(error) => {
-                            log::warn!("Failed to render image for {controller} slot {position}: {error}");
-                            continue;
+                    Some(state) => {
+                        // Compositing is CPU work, so it goes to a blocking worker rather than
+                        // holding a runtime thread.
+                        let state = state.clone();
+                        match tokio::task::spawn_blocking(move || render_state(&state, width, height)).await {
+                            Ok(Ok(image)) => Some(image),
+                            Ok(Err(error)) => {
+                                log::warn!("Failed to render image for {controller} slot {position}: {error}");
+                                continue;
+                            }
+                            Err(error) => {
+                                log::warn!("Rendering panicked for {controller} slot {position}: {error}");
+                                continue;
+                            }
                         }
-                    },
+                    }
                     None => None,
                 },
                 // `None` clears the slot on the device.
                 None => None,
             };
 
-            crate::bridge(frontend::instances::update_image(context, image)).await;
+            frontend::instances::update_image(context, image).await;
         }
     }
 }
@@ -1125,7 +1164,7 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
         cx.notify();
     });
 
-    push_device_images(device, profile).await;
+    push_device_images(device, profile);
 }
 
 /// Re-apply the current definition of any custom action that a slot was created from.
@@ -1268,6 +1307,12 @@ enum PageAction {
     Remove,
 }
 
+/// The border a required field should wear: red when it has been left blank, otherwise the input's
+/// ordinary one.
+fn required(blank: bool, cx: &App) -> gpui::Hsla {
+    if blank { cx.theme().danger } else { cx.theme().input }
+}
+
 /// A labelled form field in the create dialog.
 fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
     v_flex().gap_1().child(div().text_sm().child(label)).child(control)
@@ -1297,13 +1342,21 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
             ));
             let _ = form.update(cx, |form, cx| {
                 form.error = Some(message);
+                form.probing = false;
                 cx.notify();
             });
             return;
         }
 
         // Deciding icon-vs-photo decodes the file and scans every pixel, so it belongs on a worker
-        // rather than the thread painting the window.
+        // rather than the thread painting the window. It still takes a moment on a large photo, so
+        // say so.
+        let _ = form.update(cx, |form, cx| {
+            form.probing = true;
+            form.error = None;
+            cx.notify();
+        });
+
         let probe = path.clone();
         let is_icon = crate::bridge(async move {
             tokio::task::spawn_blocking(move || custom_actions::has_transparency(&probe))
@@ -1317,6 +1370,7 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
             form.image_is_icon = is_icon;
             form.existing_image = None;
             form.error = None;
+            form.probing = false;
             cx.notify();
         });
     })
