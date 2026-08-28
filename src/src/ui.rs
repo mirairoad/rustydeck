@@ -58,6 +58,30 @@ fn opaque(colour: gpui::Hsla) -> gpui::Hsla {
     gpui::Hsla { a: 1.0, ..colour }
 }
 
+/// Simulated dial rotation. Compiled out of a release build, which has no simulated device.
+fn simulate_rotate(device: &str, dial: u8, ticks: i16) {
+    #[cfg(debug_assertions)]
+    crate::simulator::rotate(device, dial, ticks);
+    #[cfg(not(debug_assertions))]
+    let _ = (device, dial, ticks);
+}
+
+/// Simulated dial press. Compiled out of a release build.
+fn simulate_press(device: &str, dial: u8) {
+    #[cfg(debug_assertions)]
+    crate::simulator::press_dial(device, dial);
+    #[cfg(not(debug_assertions))]
+    let _ = (device, dial);
+}
+
+/// Simulated tap of a strip rectangle. Compiled out of a release build.
+fn simulate_tap(device: &str, position: u8) {
+    #[cfg(debug_assertions)]
+    crate::simulator::tap_strip(device, position);
+    #[cfg(not(debug_assertions))]
+    let _ = (device, position);
+}
+
 /// Whether a device is simulated. Always false in a release build, which has none.
 fn is_simulated(device_id: &str) -> bool {
     #[cfg(debug_assertions)]
@@ -835,12 +859,11 @@ impl RustyDeckShell {
             // A strip segment is the exception: its gesture is a tap, not a press, so on a
             // simulated device it goes in through the touchscreen path instead.
             let press_context = context.clone();
-            let simulate_tap = is_simulated(&device.id) && controller == ENCODER_CONTROLLER;
+            let tap_instead_of_press = is_simulated(&device.id) && controller == ENCODER_CONTROLLER;
             cell = cell.on_click(move |_event, _window, cx| {
                 let context = press_context.clone();
-                if simulate_tap {
-                    #[cfg(debug_assertions)]
-                    crate::simulator::tap_strip(&context.device, context.position);
+                if tap_instead_of_press {
+                    simulate_tap(&context.device, context.position);
                     return;
                 }
                 cx.background_spawn(async move {
@@ -1405,67 +1428,76 @@ impl RustyDeckShell {
         };
 
         let picker = self.device_picker_open.then(|| {
-            v_flex()
-                .absolute()
-                .top(px(44.0))
-                .right_0()
-                .w(px(240.0))
-                .p_1()
-                .gap_1()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(opaque(cx.theme().background))
-                .shadow_lg()
-                .children({
-                    // Real hardware first, then the simulated models under a heading, so a fake
-                    // deck is never mistaken for something that is actually plugged in.
-                    let mut devices: Vec<DeviceInfo> = self.devices.iter().cloned().collect();
-                    devices.sort_by_key(|device| (is_simulated(&device.id), device.name.clone()));
-                    let first_simulated = devices.iter().position(|device| is_simulated(&device.id));
+            // `deferred` paints this after the rest of the tree, so it sits above the device slots
+            // instead of sliding behind them when the window is small enough for them to overlap;
+            // `occlude` stops a click passing through to whatever is underneath. The same pairing
+            // the row and slot menus use.
+            deferred(
+                v_flex()
+                    .occlude()
+                    .absolute()
+                    // Held off the window edge rather than flush against it.
+                    .top(px(49.0))
+                    .right(px(5.0))
+                    .w(px(240.0))
+                    .p_1()
+                    .gap_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(opaque(cx.theme().background))
+                    .shadow_lg()
+                    .children({
+                        // Real hardware first, then the simulated models under a heading, so a fake
+                        // deck is never mistaken for something that is actually plugged in.
+                        let mut devices: Vec<DeviceInfo> = self.devices.iter().cloned().collect();
+                        devices.sort_by_key(|device| (is_simulated(&device.id), device.name.clone()));
+                        let first_simulated = devices.iter().position(|device| is_simulated(&device.id));
 
-                    let mut rows = Vec::with_capacity(devices.len());
-                    for (index, device) in devices.into_iter().enumerate() {
-                        let simulated = is_simulated(&device.id);
-                        let selected = self.device.as_ref().is_some_and(|current| current.id == device.id);
-                        let label = SharedString::from(device.name.clone());
+                        let mut rows = Vec::with_capacity(devices.len());
+                        for (index, device) in devices.into_iter().enumerate() {
+                            let simulated = is_simulated(&device.id);
+                            let selected = self.device.as_ref().is_some_and(|current| current.id == device.id);
+                            let label = SharedString::from(device.name.clone());
 
-                        rows.push(
-                            v_flex()
-                                .w_full()
-                                // The divider carries the heading, so it only shows when there is
-                                // real hardware above it to divide from.
-                                .when(first_simulated == Some(index) && index > 0, |column| {
-                                    column.child(
-                                        div()
+                            rows.push(
+                                v_flex()
+                                    .w_full()
+                                    // The divider carries the heading, so it only shows when there is
+                                    // real hardware above it to divide from.
+                                    .when(first_simulated == Some(index) && index > 0, |column| {
+                                        column.child(
+                                            div()
+                                                .w_full()
+                                                .mt_1()
+                                                .pt_1()
+                                                .px_2()
+                                                .border_t_1()
+                                                .border_color(cx.theme().border)
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child("Simulated"),
+                                        )
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .id(SharedString::from(device.id.clone()))
                                             .w_full()
-                                            .mt_1()
-                                            .pt_1()
-                                            .px_2()
-                                            .border_t_1()
-                                            .border_color(cx.theme().border)
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Simulated"),
-                                    )
-                                })
-                                .child(
-                                    h_flex()
-                                        .id(SharedString::from(device.id.clone()))
-                                        .w_full()
-                                        .p_2()
-                                        .rounded_md()
-                                        .text_sm()
-                                        .when(simulated, |row| row.bg(rgb(SIMULATED_TINT)))
-                                        .when(selected, |row| row.bg(cx.theme().accent))
-                                        .hover(|style| style.bg(cx.theme().accent))
-                                        .child(label)
-                                        .on_click(cx.listener(move |this, _event, _window, cx| this.select_device(device.clone(), cx))),
-                                ),
-                        );
-                    }
-                    rows
-                })
+                                            .p_2()
+                                            .rounded_md()
+                                            .text_sm()
+                                            .when(simulated, |row| row.bg(rgb(SIMULATED_TINT)))
+                                            .when(selected, |row| row.bg(cx.theme().accent))
+                                            .hover(|style| style.bg(cx.theme().accent))
+                                            .child(label)
+                                            .on_click(cx.listener(move |this, _event, _window, cx| this.select_device(device.clone(), cx))),
+                                    ),
+                            );
+                        }
+                        rows
+                    })
+            )
+            .with_priority(1)
         });
 
         h_flex()
@@ -1708,10 +1740,7 @@ impl RustyDeckShell {
                                 .bg(rgb(SIMULATED_TINT))
                                 .hover(|style| style.opacity(0.8))
                                 .child(glyph)
-                                .on_click(move |_event, _window, _cx| {
-                                    #[cfg(debug_assertions)]
-                                    crate::simulator::rotate(&device, dial, ticks);
-                                })
+                                .on_click(move |_event, _window, _cx| simulate_rotate(&device, dial, ticks))
                         };
 
                         let press_device = device_id.clone();
@@ -1728,10 +1757,7 @@ impl RustyDeckShell {
                                         .bg(rgb(SIMULATED_TINT))
                                         .hover(|style| style.opacity(0.8))
                                         .child("●")
-                                        .on_click(move |_event, _window, _cx| {
-                                            #[cfg(debug_assertions)]
-                                            crate::simulator::press_dial(&press_device, dial);
-                                        }),
+                                        .on_click(move |_event, _window, _cx| simulate_press(&press_device, dial)),
                                 )
                                 .child(turn("dial-right", "▶", 1)),
                         )
