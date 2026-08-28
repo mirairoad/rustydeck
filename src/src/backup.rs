@@ -197,6 +197,9 @@ pub async fn restore(archive: PathBuf) -> Result<PathBuf> {
 	drop(locks);
 
 	crate::store::reload_settings().await;
+	// Dropping the caches is only half of it: the read paths do not create what is missing, so
+	// without this every one of them fails with "profile not found" until the app is restarted.
+	crate::store::profiles::prime_stores().await;
 
 	Ok(aside)
 }

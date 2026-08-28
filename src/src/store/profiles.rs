@@ -438,6 +438,32 @@ pub static PROFILE_STORES: LazyLock<RwLock<ProfileStores>> = LazyLock::new(|| Rw
 /// A singleton object to manage Store instances for device configurations.
 pub static DEVICE_STORES: LazyLock<RwLock<DeviceStores>> = LazyLock::new(|| RwLock::new(DeviceStores { stores: HashMap::new() }));
 
+/// Read every connected device's profiles back into the cache.
+///
+/// A restore replaces the files these caches were built from, so they are dropped as part of the
+/// swap - but dropping them is not enough on its own. [`ProfileStores::get_profile_store`] is a
+/// read-only accessor that returns "profile not found" rather than creating what is missing, so
+/// every read path stays broken until something primes the cache. Registration is what normally
+/// does that, and after a restore there is no registration to wait for: the device never went
+/// away.
+///
+/// Device stores need no equivalent - [`DeviceStores::get_selected_profile`] and
+/// [`DeviceStores::dials_mut`] both create theirs on demand.
+pub async fn prime_stores() {
+	// Collected first, so no DashMap guard is held across an await.
+	let devices: Vec<DeviceInfo> = DEVICES.iter().map(|entry| entry.value().clone()).collect();
+
+	for device in devices {
+		let Ok(profiles) = get_device_profiles(&device.id) else { continue };
+		let mut profile_stores = PROFILE_STORES.write().await;
+		for profile in profiles {
+			if let Err(error) = profile_stores.get_profile_store_mut(&device, &profile).await {
+				log::error!("Failed to read profile {profile} of {} back: {error}", device.id);
+			}
+		}
+	}
+}
+
 pub struct Locks<'a> {
 	#[allow(dead_code)]
 	pub device_stores: RwLockReadGuard<'a, DeviceStores>,
