@@ -47,12 +47,12 @@ where
 /// `events::frontend::*` needs real Tokio runtime context (`tokio::fs` etc.); GPUI's own executor
 /// (used by `cx.spawn`) doesn't provide one. A `tokio::task::JoinHandle` is safely awaitable from
 /// any executor, so this just bridges the two.
-pub fn bridge<Fut>(future: Fut) -> impl Future<Output = Fut::Output>
+pub async fn bridge<Fut>(future: Fut) -> Fut::Output
 where
 	Fut: Future + Send + 'static,
 	Fut::Output: Send + 'static,
 {
-	async move { spawn(future).await.expect("backend task panicked") }
+	spawn(future).await.expect("backend task panicked")
 }
 
 /// Relaunch the binary as a fresh process and exit this one. The closest native equivalent to
@@ -61,10 +61,10 @@ pub fn restart_app() -> ! {
 	if let Err(error) = RUNTIME.get().unwrap().block_on(store::profiles::flush_stale_profiles()) {
 		log::error!("Failed to flush stale profiles before restart: {error}");
 	}
-	if let Ok(exe) = std::env::current_exe() {
-		if let Err(error) = std::process::Command::new(exe).spawn() {
-			log::error!("Failed to relaunch: {error}");
-		}
+	if let Ok(exe) = std::env::current_exe()
+		&& let Err(error) = std::process::Command::new(exe).spawn()
+	{
+		log::error!("Failed to relaunch: {error}");
 	}
 	std::process::exit(0);
 }
@@ -139,17 +139,17 @@ fn poll_tray_events(cx: &mut App) {
 					..
 				} = event
 				{
-					let _ = cx.update(|cx| toggle_main_window(cx));
+					let _ = cx.update(toggle_main_window);
 				}
 			}
 
 			while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
 				match event.id() {
 					id if id == "show" => {
-						let _ = cx.update(|cx| show_main_window(cx));
+						let _ = cx.update(show_main_window);
 					}
 					id if id == "hide" => {
-						let _ = cx.update(|cx| hide_main_window(cx));
+						let _ = cx.update(hide_main_window);
 					}
 					id if id == "restart" => restart_app(),
 					id if id == "quit" => {

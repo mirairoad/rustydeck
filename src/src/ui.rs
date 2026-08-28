@@ -1342,7 +1342,7 @@ async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
     for (controller, count, (width, height)) in groups {
         let slots = slots(&profile, controller);
 
-        for position in 0..count.min(slots.len()) {
+        for (position, slot) in slots.iter().enumerate().take(count) {
             let context = SlotContext {
                 device: device.id.clone(),
                 profile: profile.id.clone(),
@@ -1350,7 +1350,7 @@ async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
                 position: position as u8,
             };
 
-            let image = match slots[position].as_ref() {
+            let image = match slot.as_ref() {
                 Some(instance) => match instance.states.get(instance.current_state as usize) {
                     Some(state) => {
                         // Compositing is CPU work, so it goes to a blocking worker rather than
@@ -1697,6 +1697,12 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
     .detach();
 }
 
+/// What a palette row does when a control on it is clicked.
+///
+/// `Rc` rather than a boxed closure because one row hands the same handler to several places, and
+/// the rows are rebuilt on every render.
+type RowAction = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// One row in the palette. A single type covers all three kinds so both sidebar sections share it -
 /// `Sidebar` is generic over one child type.
 ///
@@ -1704,21 +1710,21 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
 #[derive(IntoElement)]
 enum PaletteRow {
     /// Opens the create-action dialog.
-    Create { collapsed: bool, on_click: Rc<dyn Fn(&mut Window, &mut App)> },
+    Create { collapsed: bool, on_click: RowAction },
     Custom {
         action: CustomAction,
         collapsed: bool,
         menu_open: bool,
-        on_menu: Rc<dyn Fn(&mut Window, &mut App)>,
-        on_execute: Rc<dyn Fn(&mut Window, &mut App)>,
-        on_edit: Rc<dyn Fn(&mut Window, &mut App)>,
-        on_delete: Rc<dyn Fn(&mut Window, &mut App)>,
+        on_menu: RowAction,
+        on_execute: RowAction,
+        on_edit: RowAction,
+        on_delete: RowAction,
     },
     Predefined { action: CustomAction, collapsed: bool },
 }
 
 /// One entry in a custom action's `...` menu.
-fn menu_entry(id: &'static str, label: &'static str, on_click: Rc<dyn Fn(&mut Window, &mut App)>, cx: &App) -> impl IntoElement {
+fn menu_entry(id: &'static str, label: &'static str, on_click: RowAction, cx: &App) -> impl IntoElement {
     div()
         .id(id)
         .w_full()
@@ -1927,7 +1933,7 @@ impl RustyDeckShell {
                     .children({
                         // Real hardware first, then the simulated models under a heading, so a fake
                         // deck is never mistaken for something that is actually plugged in.
-                        let mut devices: Vec<DeviceInfo> = self.devices.iter().cloned().collect();
+                        let mut devices: Vec<DeviceInfo> = self.devices.to_vec();
                         devices.sort_by_key(|device| (is_simulated(&device.id), device.name.clone()));
                         let first_simulated = devices.iter().position(|device| is_simulated(&device.id));
 
@@ -2023,7 +2029,7 @@ impl RustyDeckShell {
     fn render_sidebar(&self, collapsed: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().downgrade();
         let create = entity.clone();
-        let open_dialog: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+        let open_dialog: RowAction = Rc::new(move |window, cx| {
             let _ = create.update(cx, |this, cx| this.open_action_dialog(None, window, cx));
         });
 
