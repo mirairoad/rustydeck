@@ -16,7 +16,7 @@ use crate::store::{NotProfile, Store};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use image::{Rgba, RgbaImage, imageops::FilterType};
+use image::{ImageDecoder, Rgba, RgbaImage, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 
 /// The on-disk shape of `config.json`.
@@ -111,17 +111,44 @@ impl CustomAction {
 	}
 }
 
-/// Largest source image accepted for an action's artwork.
+/// Largest source image accepted for an action's artwork, in megapixels.
 ///
-/// Compositing decodes the file, resizes it twice and re-encodes both faces; the cost scales with
-/// the source's pixel count, and a photo straight off a camera is big enough to take seconds. The
-/// file size is a cheap proxy for that, checked before anything is decoded.
-pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Deliberately measured in pixels rather than bytes. Decoding costs time per pixel, and file size
+/// says almost nothing about that: an 8000x3472 JPEG is 1.3MB and thirteen times the work of a
+/// 1920x1080 PNG at 3.5MB. A byte limit would wave the expensive one through and reject the cheap
+/// one.
+///
+/// The ceiling is about memory rather than time - a 28 megapixel photo composites in about a tenth
+/// of a second, but decoding holds the whole thing uncompressed, so 100 megapixels is already 400MB
+/// resident before any resizing starts.
+pub const MAX_MEGAPIXELS: f32 = 100.0;
 
-/// Whether the file at this path is small enough to composite, and its size.
-pub fn within_size_limit(path: &Path) -> (bool, u64) {
-	let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-	(size <= MAX_IMAGE_BYTES, size)
+/// The longest edge the decoded source is kept at.
+///
+/// Both faces are at most 288px across, so anything beyond this is detail no face can show. Shrink
+/// once on load and the two fits that follow are cheap no matter how large the original was.
+const WORKING_MAX_EDGE: u32 = 1024;
+
+/// The source's dimensions, read from its header without decoding it.
+pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
+	if is_svg(path) {
+		return None;
+	}
+	image::ImageReader::open(path)
+		.and_then(|reader| reader.with_guessed_format())
+		.ok()
+		.and_then(|reader| reader.into_decoder().ok())
+		.map(|decoder| decoder.dimensions())
+}
+
+/// Whether this source is small enough to composite, and how many megapixels it actually is.
+pub fn within_pixel_limit(path: &Path) -> (bool, f32) {
+	let Some((width, height)) = dimensions(path) else {
+		// An SVG, or a header we could not read - let the decode decide.
+		return (true, 0.0);
+	};
+	let megapixels = (width as f32 * height as f32) / 1_000_000.0;
+	(megapixels <= MAX_MEGAPIXELS, megapixels)
 }
 
 pub const PICTURE: &str = "picture.png";
@@ -359,7 +386,14 @@ fn ensure_strip(directory: &Path, config: &CustomActionConfig) {
 		.filter(|path| std::fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false));
 
 	let is_icon = source.as_deref().map(has_transparency).unwrap_or(false);
-	if let Err(error) = compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source.as_deref(), is_icon, config.background.as_deref())
+	let loaded = match source.as_deref().map(Source::load).transpose() {
+		Ok(loaded) => loaded,
+		Err(error) => {
+			log::warn!("Failed to read strip source in {}: {error}", directory.display());
+			return;
+		}
+	};
+	if let Err(error) = compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, loaded.as_ref(), is_icon, config.background.as_deref())
 		.and_then(|canvas| write_picture(canvas, &directory.join(STRIP)))
 	{
 		log::warn!("Failed to compose strip artwork in {}: {error}", directory.display());
@@ -427,35 +461,82 @@ pub enum Fit {
 
 /// Decode any supported image at the requested size, rasterising SVG through resvg since the
 /// `image` crate cannot.
-fn decode(path: &Path, width: u32, height: u32, fit: Fit) -> Result<RgbaImage> {
-	if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("svg")) {
-		return decode_svg(path, width, height, fit);
-	}
+/// A source image held in whatever form each face can be built from.
+///
+/// Loading this once is the point: a save composes two faces, and decoding the file for each of
+/// them meant paying the decode twice for the same pixels.
+enum Source {
+	Raster(image::DynamicImage),
+	/// SVGs are rasterised per target size - scaling the vector to each face is the whole point of
+	/// it, and parsing the document again is cheap next to decoding a photo.
+	Vector(PathBuf),
+}
 
-	let source = image::open(path)?;
-	let (source_width, source_height) = (source.width().max(1), source.height().max(1));
-
-	let scale_x = width as f32 / source_width as f32;
-	let scale_y = height as f32 / source_height as f32;
-	// Cover takes the larger scale so the image overflows and gets cropped; contain takes the
-	// smaller so all of it fits.
-	let scale = if fit == Fit::Cover { scale_x.max(scale_y) } else { scale_x.min(scale_y) };
-
-	let scaled_width = (source_width as f32 * scale).round().max(1.0) as u32;
-	let scaled_height = (source_height as f32 * scale).round().max(1.0) as u32;
-	let scaled = source.resize_exact(scaled_width, scaled_height, FilterType::Lanczos3).to_rgba8();
-
-	// Centre the result, cropping or padding as needed.
-	let mut canvas = RgbaImage::new(width, height);
-	let offset_x = (width as i32 - scaled_width as i32) / 2;
-	let offset_y = (height as i32 - scaled_height as i32) / 2;
-	for (x, y, pixel) in scaled.enumerate_pixels() {
-		let (target_x, target_y) = (offset_x + x as i32, offset_y + y as i32);
-		if target_x >= 0 && target_y >= 0 && (target_x as u32) < width && (target_y as u32) < height {
-			canvas.put_pixel(target_x as u32, target_y as u32, *pixel);
+impl Source {
+	fn load(path: &Path) -> Result<Self> {
+		if is_svg(path) {
+			return Ok(Self::Vector(path.to_path_buf()));
 		}
+		let decoded = {
+			let _timed = crate::shared::Timed::start("decode source");
+			image::open(path)?
+		};
+
+		// Shrink once, here, rather than resizing from the full original for every face. A 28
+		// megapixel photo is otherwise resized twice at full size to produce two thumbnails.
+		let longest = decoded.width().max(decoded.height());
+		if longest <= WORKING_MAX_EDGE {
+			return Ok(Self::Raster(decoded));
+		}
+
+		// `thumbnail_exact` rather than a filtered resize: this is a throwaway intermediate on its
+		// way to a 288px face, so a box average is indistinguishable in the result and far cheaper.
+		// The quality filter is still applied by `fit`, from this working copy.
+		let _timed = crate::shared::Timed::start("shrink source to working size");
+		let scale = WORKING_MAX_EDGE as f32 / longest as f32;
+		let width = (decoded.width() as f32 * scale).round().max(1.0) as u32;
+		let height = (decoded.height() as f32 * scale).round().max(1.0) as u32;
+		Ok(Self::Raster(decoded.thumbnail_exact(width, height)))
 	}
-	Ok(canvas)
+
+	/// Fit the source into a `width` x `height` box, cropping or padding to centre it.
+	fn fit(&self, width: u32, height: u32, fit: Fit) -> Result<RgbaImage> {
+		let _timed = crate::shared::Timed::start(format!("fit {width}x{height}"));
+		let source = match self {
+			Self::Vector(path) => return decode_svg(path, width, height, fit),
+			Self::Raster(source) => source,
+		};
+
+		let (source_width, source_height) = (source.width().max(1), source.height().max(1));
+
+		let scale_x = width as f32 / source_width as f32;
+		let scale_y = height as f32 / source_height as f32;
+		// Cover takes the larger scale so the image overflows and gets cropped; contain takes the
+		// smaller so all of it fits.
+		let scale = if fit == Fit::Cover { scale_x.max(scale_y) } else { scale_x.min(scale_y) };
+
+		let scaled_width = (source_width as f32 * scale).round().max(1.0) as u32;
+		let scaled_height = (source_height as f32 * scale).round().max(1.0) as u32;
+
+		// Lanczos3 is a poor fit for the reductions here - a 1920px photo down to a 144px key is
+		// more than a tenfold shrink, where its wide kernel costs a great deal and shows nothing
+		// for it. Triangle is used for a reduction that large and Lanczos3 kept for the rest, where
+		// the source is close to the target and the sharpness is worth having.
+		let filter = if scale < 0.5 { FilterType::Triangle } else { FilterType::Lanczos3 };
+		let scaled = source.resize_exact(scaled_width, scaled_height, filter).to_rgba8();
+
+		// Centre the result, cropping or padding as needed.
+		let mut canvas = RgbaImage::new(width, height);
+		let offset_x = (width as i32 - scaled_width as i32) / 2;
+		let offset_y = (height as i32 - scaled_height as i32) / 2;
+		for (x, y, pixel) in scaled.enumerate_pixels() {
+			let (target_x, target_y) = (offset_x + x as i32, offset_y + y as i32);
+			if target_x >= 0 && target_y >= 0 && (target_x as u32) < width && (target_y as u32) < height {
+				canvas.put_pixel(target_x as u32, target_y as u32, *pixel);
+			}
+		}
+		Ok(canvas)
+	}
 }
 
 fn decode_svg(path: &Path, width: u32, height: u32, fit: Fit) -> Result<RgbaImage> {
@@ -490,6 +571,7 @@ fn decode_svg(path: &Path, width: u32, height: u32, fit: Fit) -> Result<RgbaImag
 /// Write the finished key face, dropping the alpha channel when nothing is transparent - a fully
 /// opaque key is a third smaller as RGB, and these files are written per action.
 fn write_picture(canvas: RgbaImage, path: &Path) -> Result<()> {
+	let _timed = crate::shared::Timed::start("write_picture");
 	if canvas.pixels().all(|pixel| pixel[3] == 255) {
 		image::DynamicImage::ImageRgba8(canvas).to_rgb8().save(path)?;
 	} else {
@@ -498,12 +580,34 @@ fn write_picture(canvas: RgbaImage, path: &Path) -> Result<()> {
 	Ok(())
 }
 
+/// Is this file an SVG, which is always treated as an icon?
+fn is_svg(path: &Path) -> bool {
+	path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+}
+
 /// Does this image have transparency worth preserving - i.e. is it an icon rather than a picture?
+///
+/// The header is consulted first, because it settles the question outright for most files: a JPEG
+/// has no alpha channel, and neither does a PNG saved as RGB. Only a source that actually declares
+/// an alpha channel is worth decoding to find out whether it uses it.
 pub fn has_transparency(path: &Path) -> bool {
-	if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("svg")) {
+	let _timed = crate::shared::Timed::start("has_transparency");
+	if is_svg(path) {
 		return true;
 	}
-	image::open(path).map(|image| image.to_rgba8().pixels().any(|pixel| pixel[3] < 250)).unwrap_or(false)
+
+	let declares_alpha = image::ImageReader::open(path)
+		.and_then(|reader| reader.with_guessed_format())
+		.ok()
+		.and_then(|reader| reader.into_decoder().ok())
+		.map(|decoder| decoder.color_type().has_alpha());
+
+	match declares_alpha {
+		// No alpha channel, so nothing can be transparent - answered without decoding a pixel.
+		Some(false) => false,
+		// It has one; whether any of it is actually used still needs a look.
+		_ => image::open(path).map(|image| image.to_rgba8().pixels().any(|pixel| pixel[3] < 250)).unwrap_or(false),
+	}
 }
 
 /// Paint the background, then the source image, onto a canvas of the given shape.
@@ -515,7 +619,7 @@ pub fn has_transparency(path: &Path) -> bool {
 /// Taking the shape as a parameter is what lets the touch strip have its own render. The strip is a
 /// 2:1 rectangle, so displaying the square key face there would stretch a photo; cropping a fresh
 /// 2:1 canvas from the original keeps its proportions.
-fn compose_canvas(width: u32, height: u32, file: Option<&Path>, is_icon: bool, background: Option<&str>) -> Result<RgbaImage> {
+fn compose_canvas(width: u32, height: u32, source: Option<&Source>, is_icon: bool, background: Option<&str>) -> Result<RgbaImage> {
 	let mut canvas = RgbaImage::new(width, height);
 	if let Some(background) = background {
 		let colour = parse_colour(background);
@@ -524,13 +628,13 @@ fn compose_canvas(width: u32, height: u32, file: Option<&Path>, is_icon: bool, b
 		}
 	}
 
-	if let Some(file) = file {
+	if let Some(source) = source {
 		// An icon is inset by a tenth so the background reads as a border; a picture fills the face.
 		let (inset, fit) = if is_icon { (0.1, Fit::Contain) } else { (0.0, Fit::Cover) };
 		let margin_x = (width as f32 * inset).round() as u32;
 		let margin_y = (height as f32 * inset).round() as u32;
 
-		let decoded = decode(file, width - margin_x * 2, height - margin_y * 2, fit)?;
+		let decoded = source.fit(width - margin_x * 2, height - margin_y * 2, fit)?;
 		for (x, y, pixel) in decoded.enumerate_pixels() {
 			blend(
 				&mut canvas,
@@ -553,6 +657,7 @@ fn compose_canvas(width: u32, height: u32, file: Option<&Path>, is_icon: bool, b
 ///
 /// Returns the copied source's filename, if there was one.
 fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
+	let _timed = crate::shared::Timed::start("compose (both faces)");
 	std::fs::create_dir_all(directory)?;
 
 	let mut source_name = None;
@@ -574,13 +679,16 @@ fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
 	}
 
 	let background = spec.background.as_deref();
-	let source = stored_source.as_deref();
 	// Decided once rather than per face: the check decodes the whole image, and both faces want the
 	// same answer about it.
-	let is_icon = source.map(has_transparency).unwrap_or(false);
+	let is_icon = stored_source.as_deref().map(has_transparency).unwrap_or(false);
+	let source = stored_source.as_deref().map(Source::load).transpose()?;
 
-	write_picture(compose_canvas(CANVAS, CANVAS, source, is_icon, background)?, &directory.join(PICTURE))?;
-	write_picture(compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source, is_icon, background)?, &directory.join(STRIP))?;
+	write_picture(compose_canvas(CANVAS, CANVAS, source.as_ref(), is_icon, background)?, &directory.join(PICTURE))?;
+	write_picture(
+		compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source.as_ref(), is_icon, background)?,
+		&directory.join(STRIP),
+	)?;
 
 	Ok(source_name)
 }

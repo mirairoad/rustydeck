@@ -50,10 +50,21 @@ psp = { git = "https://github.com/pewsheen/psp", rev = "d2936425122e26822a2c126e
 libc = "0.2"
 gtk = "0.18"
 
+[profile.dev.package."*"]
+# Dependencies are optimised even in a debug build. The image codecs are the hot path when
+# composing artwork, and unoptimised they run roughly eighty times slower - enough that a large
+# photo felt broken in development while being fine in a release build. Only dependencies are
+# affected; this crate stays unoptimised and debuggable, and they are compiled once.
+opt-level = 3
+
 [profile.release]
 # This ships as a single desktop binary, so favour size and let the build take longer:
 # one codegen unit and fat LTO let the linker drop what nothing reaches, and the debug
 # symbols that dominate the unoptimised build are stripped out entirely.
+#
+# The single codegen unit is why the last stretch of a release build pegs one core. Measured
+# against `lto = "thin"` with 16 units, that serial tail costs about five seconds of a 155s build -
+# the other 600 crates compile in parallel either way - and buys 5MB of binary. Not worth trading.
 opt-level = "s"
 lto = "fat"
 codegen-units = 1

@@ -142,6 +142,7 @@ fn draw_line(canvas: &mut RgbaImage, font: &FontVec, scale: PxScale, line: &str,
 /// infobar is a wide letterbox, and (as in the old renderer) text and stroke sizes scale with the
 /// canvas height while the icon is stretched to the canvas aspect.
 pub fn render_state(state: &ActionState, width: u32, height: u32) -> Result<String> {
+	let _timed = crate::shared::Timed::start(format!("render_state {width}x{height}"));
 	let mut canvas = RgbaImage::new(width, height);
 
 	// The old renderer deliberately leaves a pure-black background transparent so that only

@@ -49,6 +49,10 @@ const SYSTEM_CATEGORY: &str = "System";
 /// Tint for simulated devices and their controls, so a fake deck never reads as a real one.
 const SIMULATED_TINT: u32 = 0x7C3AED;
 
+/// Height of an artwork preview tile. The key face is square at this size and the strip twice as
+/// wide, matching the 2:1 region the hardware writes.
+const PREVIEW_HEIGHT: f32 = 48.0;
+
 /// A theme colour forced fully opaque.
 ///
 /// The theme's `background` carries alpha, which is right for the window itself but wrong for a
@@ -629,21 +633,28 @@ impl RustyDeckShell {
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .child(
-                                    // The tile always shows, so a colour-only action still has a
-                                    // preview once the image is cleared.
-                                    div()
-                                        .size(px(48.0))
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(cx.theme().border)
-                                        .overflow_hidden()
-                                        .when_some(preview_background, |tile, colour| tile.bg(colour))
-                                        .children(preview.clone().map(|path| {
-                                            let inset = if preview_is_icon { px(10.0) } else { px(0.0) };
-                                            div().size_full().p(inset).child(img(resolve_image_path(&path)).size_full())
-                                        })),
-                                )
+                                // Both faces are shown, because the same source is composited twice
+                                // and a photo that suits a square key can be cropped unrecognisably
+                                // by the strip's 2:1 rectangle. They always render, so a
+                                // colour-only action still previews once the image is cleared.
+                                .child(preview_tile(
+                                    "Key",
+                                    PREVIEW_HEIGHT,
+                                    PREVIEW_HEIGHT,
+                                    preview.as_deref(),
+                                    preview_background,
+                                    preview_is_icon,
+                                    cx,
+                                ))
+                                .child(preview_tile(
+                                    "Strip",
+                                    PREVIEW_HEIGHT * 2.0,
+                                    PREVIEW_HEIGHT,
+                                    preview.as_deref(),
+                                    preview_background,
+                                    preview_is_icon,
+                                    cx,
+                                ))
                                 .children(preview.map(|_| {
                                     h_flex()
                                         .gap_1()
@@ -1053,6 +1064,7 @@ fn push_device_images(device: DeviceInfo, profile: Profile) {
 }
 
 async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
+    let _timed = crate::shared::Timed::start("push_device_images (all slots)");
     // Touchpoints live in the keypad array, appended after the keys.
     let keypad_count = (device.rows as usize) * (device.columns as usize) + device.touchpoints as usize;
 
@@ -1132,6 +1144,7 @@ async fn reload_dials(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp
 }
 
 async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
+    let _timed = crate::shared::Timed::start("reload_profile");
     let Some(device) = this.update(cx, |this, _| this.device.clone()).ok().flatten() else {
         return;
     };
@@ -1174,6 +1187,7 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
 /// silently drifting from the library.
 /// Returns whether anything was changed, so the caller knows to re-read the profile.
 async fn sync_custom_instances(device: &DeviceInfo, profile: &Profile) -> bool {
+    let _timed = crate::shared::Timed::start("sync_custom_instances");
     let mut library = custom_actions::load();
     library.extend(custom_actions::load_predefined());
     if library.is_empty() {
@@ -1307,6 +1321,48 @@ enum PageAction {
     Remove,
 }
 
+/// How the artwork will look on one face, captioned with which face it is.
+///
+/// Mirrors what `custom_actions::compose_canvas` does rather than approximating it: the background
+/// is painted first, then a transparent icon is inset by a tenth and scaled to fit so the colour
+/// reads as a border, while an opaque picture is centre-cropped to fill. Getting that wrong here
+/// would be worse than showing nothing, because the preview is the only thing telling the user
+/// what they are about to save.
+fn preview_tile(
+    label: &'static str,
+    width: f32,
+    height: f32,
+    image: Option<&str>,
+    background: Option<gpui::Hsla>,
+    is_icon: bool,
+    cx: &App,
+) -> impl IntoElement {
+    let (inset_x, inset_y) = if is_icon { (width * 0.1, height * 0.1) } else { (0.0, 0.0) };
+    let fit = if is_icon { gpui::ObjectFit::Contain } else { gpui::ObjectFit::Cover };
+
+    v_flex()
+        .gap_1()
+        .items_center()
+        .child(
+            div()
+                .w(px(width))
+                .h(px(height))
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border)
+                .overflow_hidden()
+                .when_some(background, |tile, colour| tile.bg(colour))
+                .children(image.map(|path| {
+                    div()
+                        .size_full()
+                        .px(px(inset_x))
+                        .py(px(inset_y))
+                        .child(img(resolve_image_path(path)).size_full().object_fit(fit))
+                })),
+        )
+        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label))
+}
+
 /// The border a required field should wear: red when it has been left blank, otherwise the input's
 /// ordinary one.
 fn required(blank: bool, cx: &App) -> gpui::Hsla {
@@ -1331,14 +1387,13 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
         };
         let path = handle.path().to_path_buf();
 
-        // Refuse before decoding anything: an oversized source is exactly the case that used to
-        // wedge the window for seconds while it was composited.
-        let (within_limit, size) = custom_actions::within_size_limit(&path);
+        // Refuse before decoding anything, on the axis that actually costs time. The header gives
+        // the dimensions without touching the pixels.
+        let (within_limit, megapixels) = custom_actions::within_pixel_limit(&path);
         if !within_limit {
             let message = SharedString::from(format!(
-                "That image is {:.1} MB. The limit is {} MB - resize it and try again.",
-                size as f64 / (1024.0 * 1024.0),
-                custom_actions::MAX_IMAGE_BYTES / (1024 * 1024),
+                "That image is {megapixels:.0} megapixels. The limit is {:.0} - resize it and try again.",
+                custom_actions::MAX_MEGAPIXELS,
             ));
             let _ = form.update(cx, |form, cx| {
                 form.error = Some(message);
