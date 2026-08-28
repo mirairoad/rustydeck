@@ -7,17 +7,13 @@ mod encoder_layouts;
 mod events;
 mod frontend_events;
 mod pages;
-mod plugins;
 mod power_events;
+#[cfg(debug_assertions)]
+mod simulator;
 mod shared;
 mod store;
 mod system_actions;
 mod ui;
-mod zip_extract;
-
-mod built_info {
-	include!(concat!(env!("OUT_DIR"), "/built.rs"));
-}
 
 use shared::PRODUCT_NAME;
 
@@ -251,6 +247,10 @@ fn main() {
 				tokio::time::sleep(Duration::from_secs(10)).await;
 			}
 		});
+		// Simulated devices exist only in debug builds, so a release binary offers real hardware
+		// and nothing else.
+		#[cfg(debug_assertions)]
+		spawn(simulator::register_all());
 		spawn(async {
 			loop {
 				tokio::time::sleep(SAVE_PROBE).await;
@@ -259,7 +259,6 @@ fn main() {
 				}
 			}
 		});
-		plugins::initialise_plugins();
 		application_watcher::init_application_watcher();
 		device_sleep::init_device_sleep();
 		power_events::init_power_events();

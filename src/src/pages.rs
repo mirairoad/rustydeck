@@ -59,10 +59,7 @@ pub async fn step(device: &str, delta: i32) -> Result<()> {
 /// Switch to a page by name, creating it if it does not exist yet.
 pub async fn show(device: &str, page: &str) -> Result<()> {
 	profiles::set_selected_profile(device.to_owned(), page.to_owned()).await?;
-	crate::frontend_events::emit(crate::frontend_events::FrontendEvent::SwitchProfile {
-		device: device.to_owned(),
-		profile: page.to_owned(),
-	});
+	crate::frontend_events::emit(crate::frontend_events::FrontendEvent::SwitchProfile);
 	Ok(())
 }
 

@@ -2,7 +2,6 @@ use crate::encoder_layouts::generate_encoder_image;
 use crate::events::inbound;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::LazyLock;
 
 use base64::Engine as _;
@@ -15,7 +14,7 @@ use image::GenericImageView as _;
 use tokio::sync::RwLock;
 
 static ELGATO_DEVICES: LazyLock<RwLock<HashMap<String, AsyncStreamDeck>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
-static HIDAPI: LazyLock<RwLock<Option<Arc<hidapi::HidApi>>>> = LazyLock::new(|| RwLock::new(None));
+static HIDAPI: LazyLock<RwLock<Option<hidapi::HidApi>>> = LazyLock::new(|| RwLock::new(None));
 
 /// Extract the average colour from an image.
 fn extract_average_colour(img: &image::DynamicImage) -> (u8, u8, u8) {
@@ -129,12 +128,31 @@ pub async fn reset_devices() {
 	}
 }
 
+/// The display name for a Stream Deck model.
+///
+/// Deliberately not the USB product string: that reports "Stream Deck Plus" while the product is
+/// branded "Stream Deck +", and the simulator would then disagree with the hardware it imitates.
+/// Naming every model here keeps the two consistent, and the exhaustive match means a model added
+/// upstream is a compile error rather than a device that quietly shows the wrong name.
+pub fn model_name(kind: Kind) -> &'static str {
+	match kind {
+		Kind::Original | Kind::OriginalV2 => "Stream Deck",
+		Kind::Mk2 | Kind::Mk2Scissor | Kind::Mk2Module => "Stream Deck MK.2",
+		Kind::Mini | Kind::MiniMk2 | Kind::MiniMk2Module => "Stream Deck Mini",
+		Kind::MiniDiscord => "Stream Deck Mini Discord",
+		Kind::Xl | Kind::XlV2 | Kind::XlV2Module => "Stream Deck XL",
+		Kind::Plus => "Stream Deck +",
+		Kind::PlusXl => "Stream Deck XL+",
+		Kind::Neo => "Stream Deck Neo",
+		Kind::Pedal => "Stream Deck Pedal",
+	}
+}
+
 async fn init(device: AsyncStreamDeck, device_id: String) {
 	if ELGATO_DEVICES.read().await.contains_key(&device_id) {
 		return;
 	}
 
-	let device_name = device.product().await.unwrap();
 	let kind = device.kind();
 	let device_type = match kind {
 		Kind::Original | Kind::OriginalV2 | Kind::Mk2 | Kind::Mk2Scissor | Kind::Mk2Module => 0,
@@ -155,12 +173,11 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 	let _ = clear_screen(&device_id).await;
 
 	crate::events::inbound::devices::register_device(
-		"",
 		crate::events::inbound::PayloadEvent {
 			payload: crate::shared::DeviceInfo {
 				id: device_id.clone(),
 				plugin: String::new(),
-				name: device_name,
+				name: model_name(kind).to_owned(),
 				rows: kind.row_count(),
 				columns: kind.column_count(),
 				encoders: kind.encoder_count(),
@@ -229,45 +246,46 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 	}
 
 	ELGATO_DEVICES.write().await.remove(&device_id);
-	crate::events::inbound::devices::deregister_device("", crate::events::inbound::PayloadEvent { payload: device_id })
+	crate::events::inbound::devices::deregister_device(crate::events::inbound::PayloadEvent { payload: device_id })
 		.await
 		.unwrap();
 }
 
 /// Attempt to initialise all connected devices.
 pub async fn initialise_devices() {
+	// `disableelgato` used to hand the "sd" namespace to a plugin-provided driver. There are no
+	// plugins now, so disabling the built-in driver just means handling no devices at all.
 	if crate::store::get_settings().value.disableelgato {
-		crate::plugins::DEVICE_NAMESPACES
-			.write()
-			.await
-			.insert("sd".to_owned(), "opendeck_alternative_elgato_implementation".to_owned());
 		return;
-	} else {
-		crate::plugins::DEVICE_NAMESPACES.write().await.remove("sd");
 	}
 
 	// Iterate through detected Elgato devices and attempt to register them.
-	let current = HIDAPI.read().await.as_ref().cloned();
-	let hid = match current {
-		Some(arc) => arc,
-		None => match elgato_streamdeck::new_hidapi() {
-			Ok(hid) => {
-				let arc = Arc::new(hid);
-				HIDAPI.write().await.replace(arc.clone());
-				arc
-			}
+	let mut hidapi = HIDAPI.write().await;
+	if hidapi.is_none() {
+		match elgato_streamdeck::new_hidapi() {
+			Ok(hid) => *hidapi = Some(hid),
 			Err(error) => {
 				log::warn!("Failed to initialise hidapi: {error}");
 				return;
 			}
-		},
-	};
-	for (kind, serial) in elgato_streamdeck::asynchronous::list_devices_async(&hid) {
+		}
+	}
+	let Some(hid) = hidapi.as_mut() else { return };
+
+	// hidapi enumerates once when its context is created and then serves that list from cache, so
+	// without this a deck plugged in after startup is never seen - the poll would re-scan the same
+	// frozen list every ten seconds forever.
+	if let Err(error) = hid.refresh_devices() {
+		log::warn!("Failed to refresh the HID device list: {error}");
+		return;
+	}
+
+	for (kind, serial) in elgato_streamdeck::asynchronous::list_devices_async(hid) {
 		let device_id = format!("sd-{serial}");
 		if ELGATO_DEVICES.read().await.contains_key(&device_id) {
 			continue;
 		}
-		match elgato_streamdeck::AsyncStreamDeck::connect(&hid, kind, &serial) {
+		match elgato_streamdeck::AsyncStreamDeck::connect(hid, kind, &serial) {
 			Ok(device) => {
 				tokio::spawn(init(device, device_id));
 			}

@@ -1,8 +1,7 @@
 use super::Error;
 
-use crate::frontend_events::{FrontendEvent, emit};
 use crate::shared::{Action, ActionContext, ActionInstance, ActionState, Context, config_dir};
-use crate::store::profiles::{LocksMut, acquire_locks, acquire_locks_mut, get_instance_mut, get_slot, get_slot_mut, save_profile_now};
+use crate::store::profiles::{acquire_locks, acquire_locks_mut, get_instance_mut, get_slot, get_slot_mut, save_profile_now};
 
 use tokio::fs::remove_dir_all;
 
@@ -40,12 +39,10 @@ pub async fn create_instance(mut action: Action, context: Context) -> Result<Opt
 				image: "opendeck/toggle-action.png".to_owned(),
 				..Default::default()
 			});
-			let _ = update_state(parent.context.clone(), &mut locks).await;
 		}
 
 		save_profile_now(&context.device, &mut locks).await?;
 		drop(locks);
-		let _ = crate::events::outbound::will_appear::will_appear(&instance).await;
 
 		let locks = acquire_locks().await;
 		let slot = get_slot(&context, &locks).await?.clone();
@@ -68,7 +65,6 @@ pub async fn create_instance(mut action: Action, context: Context) -> Result<Opt
 		let slot = slot.clone();
 
 		save_profile_now(&context.device, &mut locks).await?;
-		let _ = crate::events::outbound::will_appear::will_appear(&instance).await;
 
 		Ok(slot)
 	}
@@ -153,14 +149,10 @@ pub async fn swap_instances(source: Context, destination: Context) -> Result<boo
 
 	// Both instances leave their old slots before either arrives at its new one, so plugins never
 	// see two instances claiming the same position.
-	let _ = crate::events::outbound::will_appear::will_disappear(&source_instance, true).await;
-	let _ = crate::events::outbound::will_appear::will_disappear(&destination_instance, true).await;
 
 	*get_slot_mut(&destination, &mut locks).await? = Some(moved_to_destination.clone());
 	*get_slot_mut(&source, &mut locks).await? = Some(moved_to_source.clone());
 
-	let _ = crate::events::outbound::will_appear::will_appear(&moved_to_destination).await;
-	let _ = crate::events::outbound::will_appear::will_appear(&moved_to_source).await;
 
 	save_profile_now(&destination.device, &mut locks).await?;
 
@@ -204,13 +196,11 @@ pub async fn move_instance(source: Context, destination: Context, retain: bool) 
 	if !retain {
 		let src = get_slot_mut(&source, &mut locks).await?;
 		if let Some(old) = src {
-			let _ = crate::events::outbound::will_appear::will_disappear(old, true).await;
 			let _ = remove_dir_all(instance_images_dir(&old.context)).await;
 		}
 		*src = None;
 	}
 
-	let _ = crate::events::outbound::will_appear::will_appear(&new).await;
 
 	save_profile_now(&destination.device, &mut locks).await?;
 
@@ -225,10 +215,8 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 	};
 
 	if instance.context == context {
-		let _ = crate::events::outbound::will_appear::will_disappear(instance, true).await;
 		if let Some(children) = &instance.children {
 			for child in children {
-				let _ = crate::events::outbound::will_appear::will_disappear(child, true).await;
 				let _ = remove_dir_all(instance_images_dir(&child.context)).await;
 			}
 		}
@@ -238,7 +226,6 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 		let children = instance.children.as_mut().unwrap();
 		for (index, child) in children.iter().enumerate() {
 			if child.context == context {
-				let _ = crate::events::outbound::will_appear::will_disappear(child, true).await;
 				let _ = remove_dir_all(instance_images_dir(&child.context)).await;
 				children.remove(index);
 
@@ -264,7 +251,6 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 			}
 			if !children.is_empty() {
 				instance.states.pop();
-				let _ = update_state(instance.context.clone(), &mut locks).await;
 			}
 		}
 	}
@@ -274,19 +260,12 @@ pub async fn remove_instance(context: ActionContext) -> Result<(), Error> {
 	Ok(())
 }
 
-pub async fn update_state(context: ActionContext, locks: &mut LocksMut<'_>) -> Result<(), anyhow::Error> {
-	let contents = get_instance_mut(&context, locks).await?.cloned();
-	emit(FrontendEvent::UpdateState { context, contents });
-	Ok(())
-}
 
 pub async fn set_state(context: ActionContext, index: u16, state: ActionState) -> Result<(), Error> {
 	let mut locks = acquire_locks_mut().await;
 	let reference = get_instance_mut(&context, &mut locks).await?.unwrap();
 	reference.states[index as usize] = state;
-	let clone = reference.clone();
 	save_profile_now(&context.device, &mut locks).await?;
-	crate::events::outbound::states::title_parameters_did_change(&clone, index).await?;
 	Ok(())
 }
 
@@ -351,7 +330,3 @@ pub async fn trigger_virtual_press(context: Context) -> Result<(), Error> {
 	Ok(())
 }
 
-pub async fn key_moved(context: Context, pressed: bool) -> Result<(), anyhow::Error> {
-	emit(FrontendEvent::KeyMoved { context, pressed });
-	Ok(())
-}

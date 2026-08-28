@@ -49,16 +49,25 @@ impl ProfileStores {
 
 			let categories = crate::shared::CATEGORIES.read().await;
 			let actions = categories.values().flat_map(|v| v.actions.iter()).collect::<Vec<_>>();
-			let plugins_dir = config_dir().join("plugins");
-			let registered = crate::events::registered_plugins().await;
-			// Actions the app implements itself have no directory under `plugins/` to find, so
-			// without the first arm they fail the "is this plugin still installed?" test below and
-			// are pruned - silently deleting every page command and System dial action from every
-			// profile, and saving that over the file, each time a device reconnects.
-			let keep_instance = |instance: &ActionInstance| -> bool {
-				crate::shared::is_builtin_plugin(&instance.action.plugin)
-					|| (plugins_dir.join(&instance.action.plugin).exists() && (!registered.contains(&instance.action.plugin) || actions.iter().any(|v| v.uuid == instance.action.uuid)))
-			};
+			// Commands used to be run by a bundled plugin process; they are run in-process now.
+			// Remap instances that still name the old action so existing keys keep working - and
+			// so they survive the check below, which would otherwise see a plugin that is gone.
+			let run_command = actions.iter().find(|action| action.uuid == crate::shared::RUN_COMMAND_UUID).map(|action| (*action).clone());
+			if let Some(run_command) = run_command {
+				for slot in store.value.keys.iter_mut().chain(store.value.sliders.iter_mut()).chain(store.value.infobars.iter_mut()) {
+					if let Some(instance) = slot
+						&& instance.action.uuid == crate::shared::LEGACY_RUN_COMMAND_UUID
+					{
+						// Only the identity changes; the settings carrying the commands are kept.
+						instance.action = run_command.clone();
+					}
+				}
+			}
+
+			// Every action is implemented in the app now, so a slot is worth keeping exactly when
+			// its action is one we still register. This used to also test for a plugin directory on
+			// disk, which silently deleted every first-party action from every profile.
+			let keep_instance = |instance: &ActionInstance| -> bool { actions.iter().any(|v| v.uuid == instance.action.uuid) };
 			for slot in store.value.keys.iter_mut().chain(store.value.sliders.iter_mut()).chain(store.value.infobars.iter_mut()) {
 				if let Some(instance) = slot {
 					if !keep_instance(instance) {
@@ -174,23 +183,6 @@ impl ProfileStores {
 		Ok(())
 	}
 
-	pub fn all_from_plugin(&self, plugin: &str) -> Vec<crate::shared::ActionContext> {
-		let mut all = vec![];
-		for store in self.stores.values() {
-			for instance in store.value.keys.iter().chain(&store.value.sliders).chain(&store.value.infobars).flatten() {
-				if instance.action.plugin == plugin {
-					all.push(instance.context.clone());
-				} else if let Some(children) = &instance.children {
-					for child in children {
-						if child.action.plugin == plugin {
-							all.push(child.context.clone());
-						}
-					}
-				}
-			}
-		}
-		all
-	}
 }
 
 /// What one physical dial does.
@@ -447,21 +439,6 @@ pub async fn get_slot_mut<'a>(context: &crate::shared::Context, locks: &'a mut L
 	Ok(configured)
 }
 
-pub async fn get_instance<'a>(context: &crate::shared::ActionContext, locks: &'a Locks<'_>) -> Result<Option<&'a crate::shared::ActionInstance>, anyhow::Error> {
-	let slot = get_slot(&(context.into()), locks).await?;
-	if let Some(instance) = slot {
-		if instance.context == *context {
-			return Ok(Some(instance));
-		} else if let Some(children) = &instance.children {
-			for child in children {
-				if child.context == *context {
-					return Ok(Some(child));
-				}
-			}
-		}
-	}
-	Ok(None)
-}
 
 pub async fn get_instance_mut<'a>(context: &crate::shared::ActionContext, locks: &'a mut LocksMut<'_>) -> Result<Option<&'a mut crate::shared::ActionInstance>, anyhow::Error> {
 	let slot = get_slot_mut(&(context.into()), locks).await?;
