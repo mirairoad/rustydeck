@@ -7,7 +7,7 @@ use crate::device_render::{render_state, resolve_image_path};
 use crate::events::frontend;
 use crate::frontend_events::{self, FrontendEvent};
 use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, Profile};
-use crate::shared::RUN_COMMAND_UUID;
+use crate::shared::{BUILTIN_PLUGIN, RUN_COMMAND_UUID};
 use crate::store::profiles::DialConfig;
 
 use std::rc::Rc;
@@ -142,6 +142,64 @@ struct DraggedCustomAction {
     action: CustomAction,
 }
 
+/// What a library entry does when it lands on a slot.
+#[derive(Clone, PartialEq)]
+enum ActionKind {
+    /// The user's own shell command, run through Run Command.
+    Command,
+    /// A built-in action placed as it is, named by its UUID - the entry supplies only the artwork.
+    Builtin(SharedString),
+}
+
+/// One entry in the create-action dialog's kind picker.
+#[derive(Clone)]
+struct ActionChoice {
+    label: SharedString,
+    kind: ActionKind,
+}
+
+impl SelectItem for ActionChoice {
+    type Value = ActionKind;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.kind
+    }
+}
+
+/// The picker's entries: a shell command, then every built-in action that can sit on a key.
+///
+/// Read off the registered catalogue rather than a hand-written list, so a new first-party keypad
+/// action appears here without anything being added. Three exclusions, each for its own reason:
+/// Run Command *is* the "Run command" entry; anything from another plugin namespace is an upstream
+/// leftover with no handler behind it; and an encoder-only action would be unplaceable, since a
+/// dial is configured from its own dialog rather than by dropping a library entry on it.
+fn action_choices(categories: &[(String, Category)]) -> Vec<ActionChoice> {
+    let mut choices = vec![ActionChoice {
+        label: "Run command".into(),
+        kind: ActionKind::Command,
+    }];
+
+    let mut builtins: Vec<ActionChoice> = categories
+        .iter()
+        .flat_map(|(_, category)| category.actions.iter())
+        .filter(|action| action.plugin == BUILTIN_PLUGIN && action.uuid != RUN_COMMAND_UUID)
+        .filter(|action| action.controllers.iter().any(|controller| controller == KEYPAD_CONTROLLER))
+        .map(|action| ActionChoice {
+            label: SharedString::from(action.name.clone()),
+            kind: ActionKind::Builtin(SharedString::from(action.uuid.clone())),
+        })
+        .collect();
+
+    // The catalogue is a map, so its order is not stable between runs.
+    builtins.sort_by(|a, b| a.label.cmp(&b.label));
+    choices.extend(builtins);
+    choices
+}
+
 /// Transient state of the create/edit form.
 ///
 /// Deliberately its own entity rather than fields on the shell: the dialog's builder closure runs
@@ -150,6 +208,8 @@ struct DraggedCustomAction {
 /// separate entity is fine.
 struct ActionForm {
     name: Entity<InputState>,
+    /// Whether this entry runs a command or places a built-in action.
+    kind: Entity<SelectState<Vec<ActionChoice>>>,
     command: Entity<InputState>,
     background: Entity<ColorPickerState>,
     spec: ImageSpec,
@@ -329,6 +389,29 @@ impl RustyDeckShell {
         cx.subscribe(&dial_kind, |_this, _state, _event: &SelectEvent<Vec<DialChoice>>, cx| cx.notify())
             .detach();
 
+        let form = cx.new(|cx| ActionForm {
+            name: cx.new(|cx| InputState::new(window, cx).placeholder("Lock screen")),
+            // The catalogue has not loaded yet, so this starts with only "Run command" and is
+            // refilled from it each time the dialog opens.
+            kind: cx.new(|cx| SelectState::new(action_choices(&[]), None, window, cx)),
+            command: cx.new(|cx| InputState::new(window, cx).placeholder("loginctl lock-session")),
+            background: cx.new(|cx| ColorPickerState::new(window, cx)),
+            spec: ImageSpec::default(),
+            image_is_icon: false,
+            existing_image: None,
+            editing: None,
+            error: None,
+            invalid: false,
+            probing: false,
+            saving: false,
+        });
+
+        // Same reason as the dial picker: choosing a built-in action hides the command field, and
+        // that only shows if the shell redraws.
+        let action_kind = form.read(cx).kind.clone();
+        cx.subscribe(&action_kind, |_this, _state, _event: &SelectEvent<Vec<ActionChoice>>, cx| cx.notify())
+            .detach();
+
         Self {
             device: None,
             profile: None,
@@ -340,19 +423,7 @@ impl RustyDeckShell {
             device_auto_selected: false,
             pages: Vec::new(),
             current_page: String::new(),
-            form: cx.new(|cx| ActionForm {
-                name: cx.new(|cx| InputState::new(window, cx).placeholder("Lock screen")),
-                command: cx.new(|cx| InputState::new(window, cx).placeholder("loginctl lock-session")),
-                background: cx.new(|cx| ColorPickerState::new(window, cx)),
-                spec: ImageSpec::default(),
-                image_is_icon: false,
-                existing_image: None,
-                editing: None,
-                error: None,
-                invalid: false,
-                probing: false,
-                saving: false,
-            }),
+            form,
             dial_form,
             dials: Vec::new(),
             row_menu_open: None,
@@ -606,7 +677,20 @@ impl RustyDeckShell {
         let existing = edit.clone();
         let form = self.form.clone();
 
+        // Built from the live catalogue, which is empty when the shell is constructed.
+        let kinds = action_choices(&self.categories);
+        let kind = match existing.as_ref().and_then(|action| action.action_uuid()) {
+            Some(uuid) => ActionKind::Builtin(SharedString::from(uuid.to_owned())),
+            None => ActionKind::Command,
+        };
+
         form.update(cx, |form, cx| {
+            // Items first: `set_items` swaps the list without touching the selection, so selecting
+            // before refilling would look up the value in the old list.
+            form.kind.update(cx, |state, cx| {
+                state.set_items(kinds, window, cx);
+                state.set_selected_value(&kind, window, cx);
+            });
             form.name
                 .update(cx, |state, cx| state.set_value(existing.as_ref().map(|a| a.name().to_owned()).unwrap_or_default(), window, cx));
             form.command
@@ -642,7 +726,11 @@ impl RustyDeckShell {
             let pick_image = form.clone();
             let ok_form = form.clone();
             let name_state = form.read(cx).name.clone();
+            let kind_state = form.read(cx).kind.clone();
             let command_state = form.read(cx).command.clone();
+            // Only a command entry takes a command; a built-in action carries its own behaviour and
+            // takes nothing from this form but the artwork.
+            let is_command = !matches!(kind_state.read(cx).selected_value(), Some(ActionKind::Builtin(_)));
             let background_state = form.read(cx).background.clone();
             let preview = form.read(cx).preview();
             // Show what the key will actually look like: the chosen colour behind the image, with
@@ -657,7 +745,7 @@ impl RustyDeckShell {
             // covered in red is shouting before the user has done anything wrong.
             let invalid = form.read(cx).invalid;
             let name_blank = invalid && name_state.read(cx).value().trim().is_empty();
-            let command_blank = invalid && command_state.read(cx).value().trim().is_empty();
+            let command_blank = invalid && is_command && command_state.read(cx).value().trim().is_empty();
 
             dialog
                 .title(title)
@@ -670,7 +758,10 @@ impl RustyDeckShell {
                         .gap_3()
                         .p_2()
                         .child(field("Name", Input::new(&name_state).border_color(required(name_blank, cx))))
-                        .child(field("Command", Input::new(&command_state).border_color(required(command_blank, cx))))
+                        .child(field("Action", Select::new(&kind_state).placeholder("Choose an action")))
+                        .when(is_command, |body| {
+                            body.child(field("Command", Input::new(&command_state).border_color(required(command_blank, cx))))
+                        })
                         .child(field("Background", ColorPicker::new(&background_state)))
                         .child(field(
                             "Image",
@@ -728,9 +819,16 @@ impl RustyDeckShell {
                 )
                 .on_ok(move |_event, _window, cx| {
                     let name = name_state.read(cx).value().to_string();
-                    let command = command_state.read(cx).value().to_string();
-                    if name.trim().is_empty() || command.trim().is_empty() {
-                        // Keep the dialog open until both are filled in, and mark which.
+                    // A built-in action needs no command, so it does not have to have one: the
+                    // field is not even shown, and requiring it would make the entry unsaveable.
+                    let builtin = match kind_state.read(cx).selected_value() {
+                        Some(ActionKind::Builtin(uuid)) => Some(uuid.to_string()),
+                        _ => None,
+                    };
+                    let command = if builtin.is_some() { String::new() } else { command_state.read(cx).value().to_string() };
+                    if name.trim().is_empty() || (builtin.is_none() && command.trim().is_empty()) {
+                        // Keep the dialog open until the required fields are filled in, and mark
+                        // which of them are blank.
                         ok_form.update(cx, |form, cx| {
                             form.invalid = true;
                             cx.notify();
@@ -745,7 +843,7 @@ impl RustyDeckShell {
 
                     let (mut spec, editing) = ok_form.read_with(cx, |form, _| (form.spec.clone(), form.editing.clone()));
                     spec.background = ok_form.read(cx).background.read(cx).value().map(hsla_to_hex);
-                    let _ = this.update(cx, |this, cx| this.save_custom_action(name, command, spec, editing, cx));
+                    let _ = this.update(cx, |this, cx| this.save_custom_action(name, command, builtin, spec, editing, cx));
                     true
                 })
         });
@@ -757,7 +855,7 @@ impl RustyDeckShell {
     /// both faces, which on a large photo is seconds of work. Doing that inline froze the window
     /// until it finished - and because nothing else could run in the meantime, the form appeared to
     /// accept only one action per launch.
-    fn save_custom_action(&mut self, name: String, command: String, spec: ImageSpec, editing: Option<String>, cx: &mut Context<Self>) {
+    fn save_custom_action(&mut self, name: String, command: String, builtin: Option<String>, spec: ImageSpec, editing: Option<String>, cx: &mut Context<Self>) {
         let form = self.form.clone();
         form.update(cx, |form, cx| {
             form.saving = true;
@@ -769,8 +867,8 @@ impl RustyDeckShell {
             let edited = editing.clone();
             let result = crate::bridge(async move {
                 tokio::task::spawn_blocking(move || match &editing {
-                    Some(id) => custom_actions::update(id, name, command, &spec),
-                    None => custom_actions::create(name, command, &spec),
+                    Some(id) => custom_actions::update(id, name, command, builtin, &spec),
+                    None => custom_actions::create(name, command, builtin, &spec),
                 })
                 .await
                 .unwrap_or_else(|error| Err(anyhow::anyhow!("compositing panicked: {error}")))
