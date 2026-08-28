@@ -154,6 +154,11 @@ struct ActionForm {
     existing_image: Option<String>,
     /// Id of the action being edited, or `None` when creating.
     editing: Option<String>,
+    /// Why the last pick or save was refused, shown in the dialog.
+    error: Option<SharedString>,
+    /// Whether artwork is being composited right now, so the form can say so and refuse a second
+    /// save on top of the first.
+    saving: bool,
 }
 
 impl ActionForm {
@@ -328,6 +333,8 @@ impl RustyDeckShell {
                 image_is_icon: false,
                 existing_image: None,
                 editing: None,
+                error: None,
+                saving: false,
             }),
             dial_form,
             dials: Vec::new(),
@@ -552,6 +559,8 @@ impl RustyDeckShell {
                 .update(cx, |state, cx| state.set_value(existing.as_ref().map(|a| a.command().to_owned()).unwrap_or_default(), window, cx));
             form.spec = ImageSpec::default();
             form.editing = existing.as_ref().map(|a| a.slug.clone());
+            form.error = None;
+            form.saving = false;
 
             // Preview against the *source* image, not the composited picture - the latter already
             // has the previous background baked in, which would sit opaquely over a new colour.
@@ -585,6 +594,8 @@ impl RustyDeckShell {
             // compositor applies when writing picture.png.
             let preview_background = background_state.read(cx).value();
             let preview_is_icon = form.read(cx).image_is_icon;
+            let error = form.read(cx).error.clone();
+            let saving = form.read(cx).saving;
 
             dialog
                 .title(title)
@@ -635,13 +646,24 @@ impl RustyDeckShell {
                                 .child(Button::new("pick-image").label("Choose image…").on_click(move |_event, _window, cx| {
                                     pick_file(pick_image.clone(), cx);
                                 })),
-                        )),
+                        ))
+                        // Compositing happens on a worker, so say that it is happening rather than
+                        // leaving the dialog looking inert.
+                        .when(saving, |body| {
+                            body.child(div().text_sm().text_color(cx.theme().muted_foreground).child("Composing artwork…"))
+                        })
+                        .children(error.map(|message| div().text_sm().text_color(cx.theme().danger).child(message))),
                 )
                 .on_ok(move |_event, _window, cx| {
                     let name = name_state.read(cx).value().to_string();
                     let command = command_state.read(cx).value().to_string();
                     if name.trim().is_empty() || command.trim().is_empty() {
                         // Keep the dialog open until both are filled in.
+                        return false;
+                    }
+                    if ok_form.read(cx).saving {
+                        // A save is already in flight; a second one would race it onto the same
+                        // directory.
                         return false;
                     }
 
@@ -653,32 +675,72 @@ impl RustyDeckShell {
         });
     }
 
+    /// Composite and store an action, then fold the result back into the library.
+    ///
+    /// The compositing runs on a worker: it decodes the source, resizes it twice and re-encodes
+    /// both faces, which on a large photo is seconds of work. Doing that inline froze the window
+    /// until it finished - and because nothing else could run in the meantime, the form appeared to
+    /// accept only one action per launch.
     fn save_custom_action(&mut self, name: String, command: String, spec: ImageSpec, editing: Option<String>, cx: &mut Context<Self>) {
-        let result = match &editing {
-            Some(id) => custom_actions::update(id, name, command, &spec).inspect(|updated| {
-                // An edit can rename the directory, so match on the id we edited, not the new one.
-                match self.custom.iter_mut().find(|action| action.slug == *id) {
-                    Some(existing) => *existing = updated.clone(),
-                    None => self.custom.push(updated.clone()),
+        let form = self.form.clone();
+        form.update(cx, |form, cx| {
+            form.saving = true;
+            form.error = None;
+            cx.notify();
+        });
+
+        cx.spawn(async move |this, cx| {
+            let edited = editing.clone();
+            let result = crate::bridge(async move {
+                tokio::task::spawn_blocking(move || match &editing {
+                    Some(id) => custom_actions::update(id, name, command, &spec),
+                    None => custom_actions::create(name, command, &spec),
+                })
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("compositing panicked: {error}")))
+            })
+            .await;
+
+            let _ = form.update(cx, |form, cx| {
+                form.saving = false;
+                if let Err(error) = &result {
+                    form.error = Some(SharedString::from(format!("Could not save: {error}")));
                 }
-            }),
-            None => custom_actions::create(name, command, &spec).inspect(|action| self.custom.push(action.clone())),
-        };
+                cx.notify();
+            });
 
-        match result {
-            // Artwork is rewritten to the same `picture.png` path, so GPUI would keep serving the
-            // bitmap it decoded earlier - evict it, or the sidebar and any slot already using this
-            // action keep showing the old picture.
-            Ok(action) => {
-                let source: gpui::ImageSource = action.image_path().into();
-                source.remove_asset(cx);
+            let action = match result {
+                Ok(action) => action,
+                Err(error) => {
+                    log::error!("Failed to save custom action: {error}");
+                    return;
+                }
+            };
 
-                // Slots already carrying this action need re-pushing so the hardware follows too.
-                cx.spawn(async move |this, cx| reload_profile(&this, cx).await).detach();
-            }
-            Err(error) => log::error!("Failed to save custom action: {error}"),
-        }
-        cx.notify();
+            let _ = this.update(cx, |this, cx| {
+                match &edited {
+                    // An edit can rename the directory, so match on the id we edited, not the new one.
+                    Some(id) => match this.custom.iter_mut().find(|candidate| candidate.slug == *id) {
+                        Some(existing) => *existing = action.clone(),
+                        None => this.custom.push(action.clone()),
+                    },
+                    None => this.custom.push(action.clone()),
+                }
+
+                // Artwork is rewritten to the same `picture.png` path, so GPUI would keep serving
+                // the bitmap it decoded earlier - evict it, or the sidebar and any slot already
+                // using this action keep showing the old picture.
+                for path in [action.image_path(), action.strip_path()] {
+                    let source: gpui::ImageSource = path.into();
+                    source.remove_asset(cx);
+                }
+                cx.notify();
+            });
+
+            // Slots already carrying this action need re-pushing so the hardware follows too.
+            reload_profile(&this, cx).await;
+        })
+        .detach();
     }
 
     /// Place a custom action on a slot: create the Run Command instance that backs it, then write
@@ -1224,11 +1286,37 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
         };
         let path = handle.path().to_path_buf();
 
-        let is_icon = custom_actions::has_transparency(&path);
+        // Refuse before decoding anything: an oversized source is exactly the case that used to
+        // wedge the window for seconds while it was composited.
+        let (within_limit, size) = custom_actions::within_size_limit(&path);
+        if !within_limit {
+            let message = SharedString::from(format!(
+                "That image is {:.1} MB. The limit is {} MB - resize it and try again.",
+                size as f64 / (1024.0 * 1024.0),
+                custom_actions::MAX_IMAGE_BYTES / (1024 * 1024),
+            ));
+            let _ = form.update(cx, |form, cx| {
+                form.error = Some(message);
+                cx.notify();
+            });
+            return;
+        }
+
+        // Deciding icon-vs-photo decodes the file and scans every pixel, so it belongs on a worker
+        // rather than the thread painting the window.
+        let probe = path.clone();
+        let is_icon = crate::bridge(async move {
+            tokio::task::spawn_blocking(move || custom_actions::has_transparency(&probe))
+                .await
+                .unwrap_or(false)
+        })
+        .await;
+
         let _ = form.update(cx, |form, cx| {
             form.spec.file = Some(path);
             form.image_is_icon = is_icon;
             form.existing_image = None;
+            form.error = None;
             cx.notify();
         });
     })
