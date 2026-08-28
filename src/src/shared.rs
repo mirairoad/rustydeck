@@ -71,6 +71,9 @@ impl Drop for Timed {
 	fn drop(&mut self) {
 		#[cfg(debug_assertions)]
 		log::info!("[timing] {} took {:.1?}", self.label, self.start.elapsed());
+		// The fields exist only for that line, so a release build has to be told they are spoken for.
+		#[cfg(not(debug_assertions))]
+		let _ = (&self.label, self.start);
 	}
 }
 
