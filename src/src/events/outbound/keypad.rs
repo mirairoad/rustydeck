@@ -1,24 +1,32 @@
-use super::{GenericInstancePayload, send_to_plugin};
+//! What a key press does.
+//!
+//! Every action is implemented in-process, so this dispatches on the action's UUID rather than
+//! forwarding the press to a plugin.
 
-use crate::events::frontend::instances::{key_moved, update_state};
-use crate::shared::{ActionContext, Context};
+use crate::shared::{ActionInstance, Context};
 use crate::store::profiles::{acquire_locks_mut, get_slot_mut, mark_profile_stale};
 
 use std::sync::LazyLock;
-use std::time::Duration;
 
 use dashmap::DashMap;
-use serde::Serialize;
 
 static KEY_DOWN_TARGETS: LazyLock<DashMap<(String, u8), Context>> = LazyLock::new(DashMap::new);
 
-#[derive(Serialize)]
-struct KeyEvent {
-	event: &'static str,
-	action: String,
-	context: ActionContext,
-	device: String,
-	payload: GenericInstancePayload,
+/// One of an instance's stored commands, empty when unset.
+pub fn command_setting(instance: &ActionInstance, key: &str) -> String {
+	instance.settings.get(key).and_then(|value| value.as_str()).unwrap_or_default().to_owned()
+}
+
+/// How far a page action steps, if this is one.
+///
+/// The profile locks must be released before stepping: switching a page re-acquires them, so
+/// stepping inline would deadlock.
+fn page_step_for(uuid: &str) -> Option<i32> {
+	match uuid {
+		crate::shared::PAGE_LEFT_UUID => Some(-1),
+		crate::shared::PAGE_RIGHT_UUID => Some(1),
+		_ => None,
+	}
 }
 
 pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
@@ -31,19 +39,11 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		position: key,
 	};
 
-	let _ = key_moved(context.clone(), true).await;
 	KEY_DOWN_TARGETS.insert((device.to_owned(), key), context.clone());
 
 	let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
 
-	// Page stepping is handled here rather than by a plugin. Crucially the profile locks must be
-	// released first: switching a page re-acquires them, so stepping inline would deadlock.
-	let step = match instance.action.uuid.as_str() {
-		crate::shared::PAGE_LEFT_UUID => Some(-1),
-		crate::shared::PAGE_RIGHT_UUID => Some(1),
-		_ => None,
-	};
-	if let Some(delta) = step {
+	if let Some(delta) = page_step_for(&instance.action.uuid) {
 		drop(locks);
 		let device = device.to_owned();
 		crate::spawn(async move {
@@ -54,96 +54,10 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		return Ok(());
 	}
 
-	if instance.action.uuid == "opendeck.multiaction" {
-		let children = instance.children.clone().unwrap_or_default();
-		let delays: Vec<u64> = instance
-			.settings
-			.get("delays")
-			.and_then(|v| v.as_array())
-			.map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
-			.unwrap_or_default();
-
+	if instance.action.uuid == crate::shared::RUN_COMMAND_UUID {
+		let command = command_setting(instance, "down");
 		drop(locks);
-
-		for (i, child) in children.iter().enumerate() {
-			send_to_plugin(
-				&child.action.plugin,
-				&KeyEvent {
-					event: "keyDown",
-					action: child.action.uuid.clone(),
-					context: child.context.clone(),
-					device: child.context.device.clone(),
-					payload: GenericInstancePayload::new(child),
-				},
-			)
-			.await?;
-
-			tokio::time::sleep(Duration::from_millis(100)).await;
-
-			send_to_plugin(
-				&child.action.plugin,
-				&KeyEvent {
-					event: "keyUp",
-					action: child.action.uuid.clone(),
-					context: child.context.clone(),
-					device: child.context.device.clone(),
-					payload: GenericInstancePayload::new(child),
-				},
-			)
-			.await?;
-
-			let delay = delays.get(i).copied().unwrap_or(100);
-			if delay > 0 {
-				tokio::time::sleep(Duration::from_millis(delay)).await;
-			}
-		}
-
-		let mut locks = acquire_locks_mut().await;
-
-		if let Some(instance) = get_slot_mut(&context, &mut locks).await?
-			&& let Some(children) = &mut instance.children
-		{
-			for child in &mut *children {
-				if child.states.len() == 2 && !child.action.disable_automatic_states {
-					child.current_state = (child.current_state + 1) % (child.states.len() as u16);
-				}
-			}
-
-			for child in children.iter().map(|x| x.context.clone()).collect::<Vec<_>>() {
-				let _ = update_state(child, &mut locks).await;
-			}
-		}
-
-		mark_profile_stale(device, &mut locks).await?;
-	} else if instance.action.uuid == "opendeck.toggleaction" {
-		let children = instance.children.as_ref().unwrap();
-		if children.is_empty() {
-			return Ok(());
-		}
-		let child = &children[instance.current_state as usize];
-		send_to_plugin(
-			&child.action.plugin,
-			&KeyEvent {
-				event: "keyDown",
-				action: child.action.uuid.clone(),
-				context: child.context.clone(),
-				device: child.context.device.clone(),
-				payload: GenericInstancePayload::new(child),
-			},
-		)
-		.await?;
-	} else {
-		send_to_plugin(
-			&instance.action.plugin,
-			&KeyEvent {
-				event: "keyDown",
-				action: instance.action.uuid.clone(),
-				context: instance.context.clone(),
-				device: instance.context.device.clone(),
-				payload: GenericInstancePayload::new(instance),
-			},
-		)
-		.await?;
+		crate::system_actions::run_shell(command);
 	}
 
 	Ok(())
@@ -159,7 +73,9 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		position: key,
 	};
 
-	let _ = key_moved(context.clone(), false).await;
+
+	// Only release the key that was pressed: a press and release on different slots (the page
+	// changed under the finger) is not a completed press.
 	let Some((_, expected_context)) = KEY_DOWN_TARGETS.remove(&(device.to_owned(), key)) else {
 		return Ok(());
 	};
@@ -167,52 +83,22 @@ pub async fn key_up(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		return Ok(());
 	}
 
-	let slot = get_slot_mut(&context, &mut locks).await?;
-	let Some(instance) = slot else { return Ok(()) };
+	let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
 
-	// The page actions were fully handled on key-down and have no plugin to notify; sending to the
-	// non-existent "rustydeck" plugin would just queue messages forever.
-	if matches!(instance.action.uuid.as_str(), crate::shared::PAGE_LEFT_UUID | crate::shared::PAGE_RIGHT_UUID) {
+	// The page actions were fully handled on key-down.
+	if page_step_for(&instance.action.uuid).is_some() {
 		return Ok(());
 	}
 
-	if instance.action.uuid == "opendeck.toggleaction" {
-		let index = instance.current_state as usize;
-		let children = instance.children.as_ref().unwrap();
-		if children.is_empty() {
-			return Ok(());
-		}
-		let child = &children[index];
-		send_to_plugin(
-			&child.action.plugin,
-			&KeyEvent {
-				event: "keyUp",
-				action: child.action.uuid.clone(),
-				context: child.context.clone(),
-				device: child.context.device.clone(),
-				payload: GenericInstancePayload::new(child),
-			},
-		)
-		.await?;
-		instance.current_state = ((index + 1) % instance.children.as_ref().unwrap().len()) as u16;
-	} else if instance.action.uuid != "opendeck.multiaction" {
-		if instance.states.len() == 2 && !instance.action.disable_automatic_states {
-			instance.current_state = (instance.current_state + 1) % (instance.states.len() as u16);
-		}
-		send_to_plugin(
-			&instance.action.plugin,
-			&KeyEvent {
-				event: "keyUp",
-				action: instance.action.uuid.clone(),
-				context: instance.context.clone(),
-				device: instance.context.device.clone(),
-				payload: GenericInstancePayload::new(instance),
-			},
-		)
-		.await?;
-	};
+	// A two-state action toggles its face on release, so the key shows what it will do next.
+	if instance.states.len() == 2 && !instance.action.disable_automatic_states {
+		instance.current_state = (instance.current_state + 1) % (instance.states.len() as u16);
+	}
 
-	let _ = update_state(instance.context.clone(), &mut locks).await;
+	if instance.action.uuid == crate::shared::RUN_COMMAND_UUID {
+		crate::system_actions::run_shell(command_setting(instance, "up"));
+	}
+
 	mark_profile_stale(device, &mut locks).await?;
 
 	Ok(())

@@ -25,13 +25,8 @@ pub fn init_power_events() {
 						}
 					});
 				}
-				PowerState::Resume => {
-					crate::spawn(async {
-						if let Err(error) = crate::events::outbound::misc::system_did_wake_up().await {
-							log::error!("Failed to send the systemDidWakeUp event: {error}");
-						}
-					});
-				}
+				// Waking used to be broadcast to plugins; nothing listens for it now.
+				PowerState::Resume => {}
 				PowerState::Suspend | PowerState::Shutdown | PowerState::Unknown => {}
 			}
 		}

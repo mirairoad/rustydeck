@@ -23,15 +23,21 @@ pub const BUILTIN_PLUGIN: &str = "rustydeck";
 /// Upstream's namespace for the actions OpenDeck itself implements (multi-action, toggle action).
 pub const UPSTREAM_BUILTIN_PLUGIN: &str = "opendeck";
 
-/// Is this action implemented by the app rather than by a plugin on disk?
-pub fn is_builtin_plugin(plugin: &str) -> bool {
-	plugin == BUILTIN_PLUGIN || plugin == UPSTREAM_BUILTIN_PLUGIN
-}
 
 /// Built-in page-stepping actions, dispatched by UUID in `events::outbound::keypad` rather than
 /// being sent to a plugin - the same way `opendeck.multiaction` is handled.
 pub const PAGE_LEFT_UUID: &str = "rustydeck.pageleft";
 pub const PAGE_RIGHT_UUID: &str = "rustydeck.pageright";
+
+/// Runs a shell command. The app runs it itself through the user's login shell; there is no
+/// plugin process behind it.
+pub const RUN_COMMAND_UUID: &str = "rustydeck.runcommand";
+
+/// What [`RUN_COMMAND_UUID`] replaced, from when commands were run by a bundled plugin.
+///
+/// Instances in existing profiles still name it, so they are remapped on load - see
+/// `store::profiles::get_profile_store_mut`.
+pub const LEGACY_RUN_COMMAND_UUID: &str = "com.amansprojects.starterpack.runcommand";
 
 /// Built-in "System" actions: first-party, encoder-aware, and not backed by a plugin.
 pub const DEVICE_BRIGHTNESS_UUID: &str = "rustydeck.devicebrightness";
@@ -98,38 +104,12 @@ pub fn initialise_config_dir() {
 	}
 }
 
-/// Get the directory the built-in plugins (multi-action, toggle-action) were compiled into.
-///
-/// Tauri resolved this via its bundled "Resource" directory; without that bundling step we look
-/// next to the running executable first (a plain installed build), falling back to the build.rs
-/// output directory in a dev build.
-pub fn builtin_plugins_dir() -> std::path::PathBuf {
-	if let Ok(exe) = std::env::current_exe()
-		&& let Some(dir) = exe.parent()
-	{
-		let candidate = dir.join("plugins");
-		if candidate.is_dir() {
-			return candidate;
-		}
-	}
-	Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("plugins")
-}
 
 /// Get whether or not the application is running inside the Flatpak sandbox.
 pub fn is_flatpak() -> bool {
 	var("FLATPAK_ID").is_ok() || var("container").map(|x| x.to_lowercase().trim() == "flatpak").unwrap_or(false)
 }
 
-/// Convert an icon specified in a plugin manifest to its full path.
-pub fn convert_icon(path: String) -> String {
-	if Path::new(&(path.clone() + ".svg")).exists() {
-		path + ".svg"
-	} else if Path::new(&(path.clone() + "@2x.png")).exists() {
-		path + "@2x.png"
-	} else {
-		path + ".png"
-	}
-}
 
 #[derive(Clone, Copy, Serialize)]
 pub struct FontSize(pub u16);
@@ -530,6 +510,19 @@ pub static CATEGORIES: LazyLock<RwLock<HashMap<String, Category>>> = LazyLock::n
 						"tooltip": "Cycle through multiple actions",
 						"controllers": [ "Keypad" ],
 						"states": [ { "image": "opendeck/toggle-action.png" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				serde_json::from_value(serde_json::json!(
+					{
+						"name": "Run Command",
+						"icon": "",
+						"plugin": BUILTIN_PLUGIN,
+						"uuid": RUN_COMMAND_UUID,
+						"tooltip": "Run a shell command",
+						"controllers": [ "Keypad", "Encoder" ],
+						"states": [ { "image": "" } ],
 						"supported_in_multi_actions": false
 					}
 				))

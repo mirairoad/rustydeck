@@ -1,6 +1,5 @@
 use super::Error;
 
-use crate::frontend_events::{FrontendEvent, emit};
 use crate::shared::DEVICES;
 use crate::store::profiles::{PROFILE_STORES, acquire_locks_mut, get_device_profiles, save_profile_now};
 
@@ -35,43 +34,11 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), Erro
 	let selected_profile = locks.device_stores.get_selected_profile(&device)?;
 
 	if selected_profile != id {
-		let old_profile = &locks.profile_stores.get_profile_store(&DEVICES.get(&device).unwrap(), &selected_profile)?.value;
-		for instance in old_profile
-			.keys
-			.iter()
-			.flatten()
-			.chain(&mut old_profile.sliders.iter().flatten())
-			.chain(&mut old_profile.infobars.iter().flatten())
-		{
-			if !matches!(instance.action.uuid.as_str(), "opendeck.multiaction" | "opendeck.toggleaction") {
-				let _ = crate::events::outbound::will_appear::will_disappear(instance, false).await;
-			} else {
-				for child in instance.children.as_ref().unwrap() {
-					let _ = crate::events::outbound::will_appear::will_disappear(child, false).await;
-				}
-			}
-		}
 		let _ = crate::events::outbound::devices::clear_screen(device.clone()).await;
 	}
 
 	// We must use the mutable version of get_profile_store in order to create the store if it does not exist.
 	let store = locks.profile_stores.get_profile_store_mut(&DEVICES.get(&device).unwrap(), &id).await?;
-	let new_profile = &store.value;
-	for instance in new_profile
-		.keys
-		.iter()
-		.flatten()
-		.chain(&mut new_profile.sliders.iter().flatten())
-		.chain(&mut new_profile.infobars.iter().flatten())
-	{
-		if !matches!(instance.action.uuid.as_str(), "opendeck.multiaction" | "opendeck.toggleaction") {
-			let _ = crate::events::outbound::will_appear::will_appear(instance).await;
-		} else {
-			for child in instance.children.as_ref().unwrap() {
-				let _ = crate::events::outbound::will_appear::will_appear(child).await;
-			}
-		}
-	}
 	store.save()?;
 
 	locks.device_stores.set_selected_profile(&device, id)?;
@@ -95,7 +62,3 @@ pub async fn rename_profile(device: String, old_id: String, new_id: String, reta
 	Ok(())
 }
 
-pub async fn rerender_images() -> Result<(), anyhow::Error> {
-	emit(FrontendEvent::RerenderImages);
-	Ok(())
-}

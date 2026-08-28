@@ -6,7 +6,8 @@ use crate::custom_actions::{self, CustomAction, ImageSpec};
 use crate::device_render::{render_state, resolve_image_path};
 use crate::events::frontend;
 use crate::frontend_events::{self, FrontendEvent};
-use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, PAGE_LEFT_UUID, PAGE_RIGHT_UUID, Profile};
+use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, Profile};
+use crate::shared::RUN_COMMAND_UUID;
 use crate::store::profiles::DialConfig;
 
 use std::rc::Rc;
@@ -27,9 +28,6 @@ use gpui_component::{
     v_flex,
 };
 
-/// The bundled starterpack action a custom action is built on - it is what actually runs the
-/// shell command (see `plugins/com.amansprojects.starterpack.sdPlugin/src/run_command.rs`).
-const RUN_COMMAND_UUID: &str = "com.amansprojects.starterpack.runcommand";
 
 const CELL_SIZE: f32 = 72.0;
 const GAP: f32 = 8.0;
@@ -47,6 +45,31 @@ const DIAL_SIZE: f32 = 44.0;
 /// The predefined group holding first-party dial actions. Hidden from the palette - see
 /// `render_sidebar`.
 const SYSTEM_CATEGORY: &str = "System";
+
+/// Tint for simulated devices and their controls, so a fake deck never reads as a real one.
+const SIMULATED_TINT: u32 = 0x7C3AED;
+
+/// A theme colour forced fully opaque.
+///
+/// The theme's `background` carries alpha, which is right for the window itself but wrong for a
+/// surface that floats over the app's own content: the picker and the right-click menus would let
+/// whatever sits behind them bleed through their panel and muddy the text on it.
+fn opaque(colour: gpui::Hsla) -> gpui::Hsla {
+    gpui::Hsla { a: 1.0, ..colour }
+}
+
+/// Whether a device is simulated. Always false in a release build, which has none.
+fn is_simulated(device_id: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        crate::simulator::is_simulated(device_id)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = device_id;
+        false
+    }
+}
 
 const KEYPAD_CONTROLLER: &str = "Keypad";
 const ENCODER_CONTROLLER: &str = "Encoder";
@@ -206,6 +229,12 @@ pub struct RustyDeckShell {
     /// Shipped entries, living on disk in the same shape so they can be re-themed or replaced.
     predefined: Vec<CustomAction>,
     device_picker_open: bool,
+    /// Whether [`Self::device`] was chosen automatically rather than by the user.
+    ///
+    /// Simulated devices register instantly while real hardware takes a moment to enumerate, so the
+    /// first auto-selection in a debug build lands on a simulated deck. This is what lets that
+    /// choice be upgraded when the real one arrives, without ever overriding a deliberate pick.
+    device_auto_selected: bool,
     /// Pages on the current device, in display order, and which one is showing.
     pages: Vec<String>,
     current_page: String,
@@ -225,15 +254,18 @@ pub struct RustyDeckShell {
 impl RustyDeckShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            // Subscribe before the first read, not after: registration is under way while this
+            // runs, and an event emitted into the gap is lost for good. That window is wide enough
+            // to matter - it is how a deck that enumerated during startup could stay invisible
+            // until something else happened to refresh.
+            let mut events = frontend_events::subscribe();
             refresh_catalogue(&this, cx).await;
 
-            let mut events = frontend_events::subscribe();
             while let Ok(event) = events.recv().await {
                 match event {
-                    FrontendEvent::Devices(_) | FrontendEvent::PluginReloaded(_) => refresh_catalogue(&this, cx).await,
+                    FrontendEvent::Devices => refresh_catalogue(&this, cx).await,
                     // A page changed on the deck - follow it in the window.
-                    FrontendEvent::SwitchProfile { .. } => reload_profile(&this, cx).await,
-                    _ => {}
+                    FrontendEvent::SwitchProfile => reload_profile(&this, cx).await,
                 }
             }
         })
@@ -261,6 +293,7 @@ impl RustyDeckShell {
             custom: custom_actions::load(),
             predefined: custom_actions::load_predefined(),
             device_picker_open: false,
+            device_auto_selected: false,
             pages: Vec::new(),
             current_page: String::new(),
             form: cx.new(|cx| ActionForm {
@@ -693,6 +726,7 @@ impl RustyDeckShell {
 
     fn select_device(&mut self, device: DeviceInfo, cx: &mut Context<Self>) {
         self.device_picker_open = false;
+        self.device_auto_selected = false;
         if self.device.as_ref().is_some_and(|current| current.id == device.id) {
             cx.notify();
             return;
@@ -797,9 +831,18 @@ impl RustyDeckShell {
             // Clicking a filled slot runs it, exactly as pressing the physical key would -
             // `trigger_virtual_press` drives the same key-down/up path the hardware does.
             // A click and a drag do not conflict: GPUI only starts a drag past its 2px threshold.
+            //
+            // A strip segment is the exception: its gesture is a tap, not a press, so on a
+            // simulated device it goes in through the touchscreen path instead.
             let press_context = context.clone();
+            let simulate_tap = is_simulated(&device.id) && controller == ENCODER_CONTROLLER;
             cell = cell.on_click(move |_event, _window, cx| {
                 let context = press_context.clone();
+                if simulate_tap {
+                    #[cfg(debug_assertions)]
+                    crate::simulator::tap_strip(&context.device, context.position);
+                    return;
+                }
                 cx.background_spawn(async move {
                     if let Err(error) = crate::bridge(frontend::instances::trigger_virtual_press(context)).await {
                         log::error!("Failed to trigger action: {error}");
@@ -848,7 +891,7 @@ impl RustyDeckShell {
                             .rounded_md()
                             .border_1()
                             .border_color(cx.theme().border)
-                            .bg(cx.theme().background)
+                            .bg(opaque(cx.theme().background))
                             .shadow_lg()
                             .child(
                                 div()
@@ -1089,14 +1132,18 @@ async fn refresh_catalogue(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::Asy
             this.devices = devices;
             this.categories = categories;
 
-            // Only auto-select when nothing is chosen; the list itself always refreshes so a
-            // device arriving later shows up in the picker.
+            // Only auto-select when nothing is chosen, or when we are still showing a simulated
+            // deck we picked ourselves and real hardware has since enumerated. A device the user
+            // chose is never overridden.
+            let hardware = this.devices.iter().find(|device| !is_simulated(&device.id)).cloned();
             let selected = match &this.device {
+                None => hardware.or_else(|| this.devices.first().cloned()),
+                Some(current) if this.device_auto_selected && is_simulated(&current.id) => hardware,
                 Some(_) => None,
-                None => this.devices.first().cloned(),
             };
             if let Some(device) = &selected {
                 this.device = Some(device.clone());
+                this.device_auto_selected = true;
             }
             cx.notify();
             selected
@@ -1182,7 +1229,6 @@ enum PaletteRow {
         on_edit: Rc<dyn Fn(&mut Window, &mut App)>,
         on_delete: Rc<dyn Fn(&mut Window, &mut App)>,
     },
-    Plugin { action: Action, collapsed: bool },
     Predefined { action: CustomAction, collapsed: bool },
 }
 
@@ -1206,7 +1252,6 @@ impl Collapsible for PaletteRow {
         match &mut self {
             PaletteRow::Create { collapsed, .. }
             | PaletteRow::Custom { collapsed, .. }
-            | PaletteRow::Plugin { collapsed, .. }
             | PaletteRow::Predefined { collapsed, .. } => *collapsed = value,
         }
         self
@@ -1216,7 +1261,6 @@ impl Collapsible for PaletteRow {
         match self {
             PaletteRow::Create { collapsed, .. }
             | PaletteRow::Custom { collapsed, .. }
-            | PaletteRow::Plugin { collapsed, .. }
             | PaletteRow::Predefined { collapsed, .. } => *collapsed,
         }
     }
@@ -1298,7 +1342,7 @@ impl RenderOnce for PaletteRow {
                                     .rounded_md()
                                     .border_1()
                                     .border_color(cx.theme().border)
-                                    .bg(cx.theme().background)
+                                    .bg(opaque(cx.theme().background))
                                     .shadow_lg()
                                     .child(menu_entry("execute", "Execute", on_execute, cx))
                                     .child(menu_entry("edit", "Edit", on_edit, cx))
@@ -1334,19 +1378,6 @@ impl RenderOnce for PaletteRow {
                     .into_any_element()
             }
 
-            PaletteRow::Plugin { action, collapsed } => palette_row(SharedString::from(action.uuid.clone()), cx)
-                .child(match action.uuid.as_str() {
-                    // Placeholders until these get real artwork.
-                    PAGE_LEFT_UUID => div().size(px(20.0)).flex_none().rounded_sm().bg(rgb(0x3B82F6)).into_any_element(),
-                    PAGE_RIGHT_UUID => div().size(px(20.0)).flex_none().rounded_sm().bg(rgb(0x22C55E)).into_any_element(),
-                    _ => img(resolve_image_path(&action.icon)).size(px(20.0)).flex_none().into_any_element(),
-                })
-                .when(!collapsed, |row| row.child(div().text_sm().child(SharedString::from(action.name.clone()))))
-                .on_drag(DraggedAction { action }, |dragged, _offset, _window, cx| {
-                    let image = Some(dragged.action.icon.clone()).filter(|icon| !icon.is_empty());
-                    cx.new(|_| DragPreview { image })
-                })
-                .into_any_element(),
         }
     }
 }
@@ -1384,21 +1415,57 @@ impl RustyDeckShell {
                 .rounded_md()
                 .border_1()
                 .border_color(cx.theme().border)
-                .bg(cx.theme().background)
-                .children(self.devices.iter().cloned().map(|device| {
-                    let label = SharedString::from(device.name.clone());
-                    let selected = self.device.as_ref().is_some_and(|current| current.id == device.id);
-                    h_flex()
-                        .id(SharedString::from(device.id.clone()))
-                        .w_full()
-                        .p_2()
-                        .rounded_md()
-                        .text_sm()
-                        .when(selected, |row| row.bg(cx.theme().accent))
-                        .hover(|style| style.bg(cx.theme().accent))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _event, _window, cx| this.select_device(device.clone(), cx)))
-                }))
+                .bg(opaque(cx.theme().background))
+                .shadow_lg()
+                .children({
+                    // Real hardware first, then the simulated models under a heading, so a fake
+                    // deck is never mistaken for something that is actually plugged in.
+                    let mut devices: Vec<DeviceInfo> = self.devices.iter().cloned().collect();
+                    devices.sort_by_key(|device| (is_simulated(&device.id), device.name.clone()));
+                    let first_simulated = devices.iter().position(|device| is_simulated(&device.id));
+
+                    let mut rows = Vec::with_capacity(devices.len());
+                    for (index, device) in devices.into_iter().enumerate() {
+                        let simulated = is_simulated(&device.id);
+                        let selected = self.device.as_ref().is_some_and(|current| current.id == device.id);
+                        let label = SharedString::from(device.name.clone());
+
+                        rows.push(
+                            v_flex()
+                                .w_full()
+                                // The divider carries the heading, so it only shows when there is
+                                // real hardware above it to divide from.
+                                .when(first_simulated == Some(index) && index > 0, |column| {
+                                    column.child(
+                                        div()
+                                            .w_full()
+                                            .mt_1()
+                                            .pt_1()
+                                            .px_2()
+                                            .border_t_1()
+                                            .border_color(cx.theme().border)
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("Simulated"),
+                                    )
+                                })
+                                .child(
+                                    h_flex()
+                                        .id(SharedString::from(device.id.clone()))
+                                        .w_full()
+                                        .p_2()
+                                        .rounded_md()
+                                        .text_sm()
+                                        .when(simulated, |row| row.bg(rgb(SIMULATED_TINT)))
+                                        .when(selected, |row| row.bg(cx.theme().accent))
+                                        .hover(|style| style.bg(cx.theme().accent))
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _event, _window, cx| this.select_device(device.clone(), cx))),
+                                ),
+                        );
+                    }
+                    rows
+                })
         });
 
         h_flex()
@@ -1592,6 +1659,8 @@ impl RustyDeckShell {
             shell = shell.child(div().flex().flex_row().gap(px(GAP)).mt(px(GAP * 2.0)).children((0..encoders).map(|dial| {
                 let configured = self.dials.get(dial as usize).is_some_and(|slot| slot.is_some());
                 let label = self.dial_label(dial);
+                let device_id = device.id.clone();
+                let simulated = is_simulated(&device.id);
 
                 let mut knob = div()
                     .id(("dial", dial as usize))
@@ -1626,6 +1695,47 @@ impl RustyDeckShell {
                             .text_color(if configured { cx.theme().foreground } else { cx.theme().muted_foreground })
                             .child(label),
                     )
+                    // A simulated deck has no knob to turn, so it gets one: these go in through the
+                    // same driver entry points the hardware uses, debounce and all.
+                    .when(simulated, |column| {
+                        let turn = |id: &'static str, glyph: &'static str, ticks: i16| {
+                            let device = device_id.clone();
+                            div()
+                                .id((id, dial as usize))
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .bg(rgb(SIMULATED_TINT))
+                                .hover(|style| style.opacity(0.8))
+                                .child(glyph)
+                                .on_click(move |_event, _window, _cx| {
+                                    #[cfg(debug_assertions)]
+                                    crate::simulator::rotate(&device, dial, ticks);
+                                })
+                        };
+
+                        let press_device = device_id.clone();
+                        column.child(
+                            h_flex()
+                                .gap_1()
+                                .child(turn("dial-left", "◀", -1))
+                                .child(
+                                    div()
+                                        .id(("dial-press", dial as usize))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .bg(rgb(SIMULATED_TINT))
+                                        .hover(|style| style.opacity(0.8))
+                                        .child("●")
+                                        .on_click(move |_event, _window, _cx| {
+                                            #[cfg(debug_assertions)]
+                                            crate::simulator::press_dial(&press_device, dial);
+                                        }),
+                                )
+                                .child(turn("dial-right", "▶", 1)),
+                        )
+                    })
                     .when(self.dial_menu_open == Some(dial), |wrapper| {
                         // Same layering as the slot menu: painted last so nothing covers it, and
                         // occluding so the click cannot fall through to the knob beneath.
@@ -1640,7 +1750,7 @@ impl RustyDeckShell {
                                     .rounded_md()
                                     .border_1()
                                     .border_color(cx.theme().border)
-                                    .bg(cx.theme().background)
+                                    .bg(opaque(cx.theme().background))
                                     .shadow_lg()
                                     .child(
                                         div()

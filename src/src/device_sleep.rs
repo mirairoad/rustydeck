@@ -30,17 +30,6 @@ pub fn init_device_sleep() {
 	});
 }
 
-pub async fn update_sleep_timeout_minutes(minutes: u16) -> Result<(), anyhow::Error> {
-	SLEEP_TIMEOUT_MINUTES.store(minutes, Ordering::Relaxed);
-
-	if minutes == 0 && !(SLEEP_WHEN_COMPUTER_LOCKED.load(Ordering::Relaxed) && COMPUTER_LOCKED.load(Ordering::Relaxed)) {
-		for device in SLEEPING_DEVICES.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>() {
-			wake_device(&device).await?;
-		}
-	}
-
-	Ok(())
-}
 
 pub async fn note_activity(device: &str) -> Result<bool, anyhow::Error> {
 	if SLEEP_WHEN_COMPUTER_LOCKED.load(Ordering::Relaxed) && COMPUTER_LOCKED.load(Ordering::Relaxed) {
@@ -94,15 +83,6 @@ pub async fn wake_device(device: &str) -> Result<bool, anyhow::Error> {
 	Ok(false)
 }
 
-pub async fn update_sleep_when_computer_locked(enabled: bool) -> Result<(), anyhow::Error> {
-	SLEEP_WHEN_COMPUTER_LOCKED.store(enabled, Ordering::Relaxed);
-	if enabled && COMPUTER_LOCKED.load(Ordering::Relaxed) {
-		sleep_for_computer_lock().await?;
-	} else if !enabled {
-		wake_from_computer_lock().await?;
-	}
-	Ok(())
-}
 
 pub async fn sleep_for_computer_lock() -> Result<(), anyhow::Error> {
 	COMPUTER_LOCKED.store(true, Ordering::Relaxed);

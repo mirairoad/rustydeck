@@ -1,9 +1,5 @@
-use super::{Coordinates, send_to_plugin};
-
 use crate::shared::{ActionContext, DEVICES};
 use crate::store::profiles::{DialConfig, acquire_locks_mut, get_instance_mut};
-
-use serde::Serialize;
 
 /// The dial's configuration, if it has one.
 ///
@@ -53,26 +49,7 @@ fn spawn_page_step(device: &str, delta: i32) {
 	});
 }
 
-#[derive(Serialize)]
-#[allow(non_snake_case)]
-struct TouchTapPayload {
-	controller: &'static str,
-	settings: serde_json::Value,
-	coordinates: Coordinates,
-	tapPos: (u16, u16),
-	hold: bool,
-}
-
-#[derive(Serialize)]
-struct TouchTapEvent {
-	event: &'static str,
-	action: String,
-	context: ActionContext,
-	device: String,
-	payload: TouchTapPayload,
-}
-
-pub async fn touch_tap(device: &str, index: u8, x: u16, y: u16, hold: bool) -> Result<(), anyhow::Error> {
+pub async fn touch_tap(device: &str, index: u8, _x: u16, _y: u16, _hold: bool) -> Result<(), anyhow::Error> {
 	let mut locks = acquire_locks_mut().await;
 	let selected_profile = locks.device_stores.get_selected_profile(device)?;
 	let context = ActionContext {
@@ -90,21 +67,12 @@ pub async fn touch_tap(device: &str, index: u8, x: u16, y: u16, hold: bool) -> R
 		return Ok(());
 	}
 
-	send_to_plugin(
-		&instance.action.plugin,
-		&TouchTapEvent {
-			event: "touchTap",
-			action: instance.action.uuid.clone(),
-			context: instance.context.clone(),
-			device: instance.context.device.clone(),
-			payload: TouchTapPayload {
-				controller: "Encoder",
-				settings: instance.settings.clone(),
-				coordinates: Coordinates { row: 0, column: index },
-				tapPos: (x, y),
-				hold,
-			},
-		},
-	)
-	.await
+	// A tap runs the rectangle's own command, in-process like every other action.
+	if instance.action.uuid == crate::shared::RUN_COMMAND_UUID {
+		let command = super::keypad::command_setting(instance, "touch");
+		drop(locks);
+		crate::system_actions::run_shell(command);
+	}
+
+	Ok(())
 }
