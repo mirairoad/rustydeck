@@ -1,5 +1,6 @@
 mod animation;
 mod application_watcher;
+mod autostart;
 mod backup;
 mod custom_actions;
 mod device_render;
@@ -94,6 +95,7 @@ fn spawn_tray_thread() {
 		let label = MenuItem::with_id("label", PRODUCT_NAME, false, None);
 		let show = MenuItem::with_id("show", "Show", true, None);
 		let hide = MenuItem::with_id("hide", "Hide", true, None);
+		let login = MenuItem::with_id("login", login_label(autostart::is_enabled()), true, None);
 		let restart = MenuItem::with_id("restart", "Restart", true, None);
 		let quit = MenuItem::with_id("quit", "Quit", true, None);
 
@@ -103,6 +105,7 @@ fn spawn_tray_thread() {
 		let _ = menu.append(&show);
 		let _ = menu.append(&hide);
 		let _ = menu.append(&PredefinedMenuItem::separator());
+		let _ = menu.append(&login);
 		let _ = menu.append(&restart);
 		let _ = menu.append(&quit);
 
@@ -110,12 +113,26 @@ fn spawn_tray_thread() {
 		// "Show" has nothing left to do - a Wayland compositor is free to refuse a raise request and
 		// Hyprland does - and with it hidden "Hide" has nothing to do either. Greying the one that
 		// does not apply is also the only way the tray can say which state the app is in.
-		let (show_item, hide_item) = (show.clone(), hide.clone());
+		let (show_item, hide_item, login_item) = (show.clone(), hide.clone(), login.clone());
+		let mut shown = autostart::is_enabled();
+		let mut tick = 0u32;
 		gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
 			let showing = WINDOW_WANTED.load(Ordering::Relaxed);
 			show_item.set_enabled(!showing);
 			hide_item.set_enabled(showing);
-			poll_tray_events();
+
+			// Right after a toggle so the label answers the click, and on a slow tick besides,
+			// because unlike the flag above this state is a file on disk that can be changed from
+			// outside the app.
+			tick = tick.wrapping_add(1);
+			if poll_tray_events() || tick.is_multiple_of(40) {
+				let enabled = autostart::is_enabled();
+				if enabled != shown {
+					shown = enabled;
+					login_item.set_text(login_label(enabled));
+				}
+			}
+
 			gtk::glib::ControlFlow::Continue
 		});
 
@@ -186,14 +203,25 @@ fn toggle_window() {
 	if WINDOW_WANTED.load(Ordering::Relaxed) { request_hide() } else { request_show() }
 }
 
-/// Drain the tray icon's and menu's global event channels.
+/// The run-at-login item says its state in its own text.
+///
+/// A checkmark would be the obvious way to show it, and `muda` exports one correctly, but whether
+/// anything is drawn for it is up to the tray - and some, quickshell among them, draw nothing. Text
+/// is the one thing every tray renders.
+fn login_label(enabled: bool) -> String {
+	format!("Run at login: {}", if enabled { "on" } else { "off" })
+}
+
+/// Drain the tray icon's and menu's global event channels, reporting whether run-at-login changed.
 ///
 /// `tray-icon`/`muda` deliver events through process-global channels meant to be polled with
 /// `try_recv` by the embedding app. This used to be polled on GPUI's executor, which only exists
 /// while a window does - so the tray stopped responding exactly when it became the only way back
 /// in. GTK's loop, which owns the tray for the lifetime of the process, is the one that never goes
 /// away.
-fn poll_tray_events() {
+fn poll_tray_events() -> bool {
+	let mut toggled = false;
+
 	while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
 		if let tray_icon::TrayIconEvent::Click {
 			button: tray_icon::MouseButton::Left,
@@ -209,11 +237,22 @@ fn poll_tray_events() {
 		match event.id() {
 			id if id == "show" => request_show(),
 			id if id == "hide" => request_hide(),
+			// The file on disk is the state, so the label is refreshed from it afterwards rather
+			// than assumed - a write that fails then shows as the label not moving.
+			id if id == "login" => {
+				let wanted = !autostart::is_enabled();
+				if let Err(error) = autostart::set(wanted) {
+					log::error!("Failed to turn running at login {}: {error:#}", if wanted { "on" } else { "off" });
+				}
+				toggled = true;
+			}
 			id if id == "restart" => restart_app(),
 			id if id == "quit" => request_quit(),
 			_ => {}
 		}
 	}
+
+	toggled
 }
 
 /// Act on show/hide requests from inside the running application, where a `Window` can be reached.
@@ -354,6 +393,12 @@ fn main() {
 		loggers.push(file_logger);
 	}
 	let _ = simplelog::CombinedLogger::init(loggers);
+
+	// How the autostart entry launches us: a login is not a request to be looked at, so the deck is
+	// served from the tray and the window waits until it is asked for.
+	if std::env::args().any(|argument| argument == "--hidden") {
+		WINDOW_WANTED.store(false, Ordering::Relaxed);
+	}
 
 	start_backend();
 	spawn_tray_thread();
