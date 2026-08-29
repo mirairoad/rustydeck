@@ -2229,22 +2229,34 @@ impl RustyDeckShell {
                     .child(
                         Button::new("restore-backup")
                             .icon(IconName::ArrowUp)
+                            .tooltip("Restore from a backup")
                             .on_click(cx.listener(|this, _event, window, cx| this.choose_backup(window, cx))),
                     )
                     .child(
                         Button::new("export-backup")
                             .icon(IconName::ArrowDown)
+                            .tooltip("Export a backup")
                             .on_click(cx.listener(|this, _event, window, cx| this.export_backup(window, cx))),
                     )
                     .child(
                         div().relative().child(
                             Button::new("swap-device")
                                 .icon(IconName::Replace)
+                                .tooltip("Switch device")
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.device_picker_open = !this.device_picker_open;
                                     cx.notify();
                                 })),
                         ),
+                    )
+                    // The same thing the compositor's own close does: the window goes away and the
+                    // deck carries on being served from the tray. Under Hyprland there is no
+                    // titlebar to close from, so without this there is no close control at all.
+                    .child(
+                        Button::new("close-window")
+                            .icon(IconName::Close)
+                            .tooltip("Close window")
+                            .on_click(|_event, _window, _cx| crate::dismiss_window()),
                     ),
             )
             .children(picker)
