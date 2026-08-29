@@ -2,7 +2,7 @@
 //! and the device's slots with drag-to-reposition and drag-to-swap (the defect this rewrite exists
 //! to fix - see PRD §3).
 
-use crate::animation::{Animation, Effect, Speed};
+use crate::animation::{Animation, Effect, Speed, Trigger};
 use crate::custom_actions::{self, CustomAction, ImageSpec};
 use crate::device_render::{render_state, resolve_image_path};
 use crate::events::frontend;
@@ -243,6 +243,34 @@ fn animation_choices() -> Vec<AnimationChoice> {
 }
 
 #[derive(Clone)]
+struct TriggerChoice {
+    label: SharedString,
+    trigger: Trigger,
+}
+
+impl SelectItem for TriggerChoice {
+    type Value = Trigger;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.trigger
+    }
+}
+
+fn trigger_choices() -> Vec<TriggerChoice> {
+    Trigger::ALL
+        .iter()
+        .map(|trigger| TriggerChoice {
+            label: SharedString::from(trigger.label()),
+            trigger: *trigger,
+        })
+        .collect()
+}
+
+#[derive(Clone)]
 struct SpeedChoice {
     label: SharedString,
     speed: Speed,
@@ -300,6 +328,8 @@ struct ActionForm {
     animation: Entity<SelectState<Vec<AnimationChoice>>>,
     /// How fast it plays. Only shown once an effect is chosen.
     speed: Entity<SelectState<Vec<SpeedChoice>>>,
+    /// Whether it loops or runs once on a press.
+    trigger: Entity<SelectState<Vec<TriggerChoice>>>,
     command: Entity<InputState>,
     background: Entity<ColorPickerState>,
     spec: ImageSpec,
@@ -486,6 +516,7 @@ impl RustyDeckShell {
             kind: cx.new(|cx| SelectState::new(action_choices(&[]), None, window, cx)),
             animation: cx.new(|cx| SelectState::new(animation_choices(), None, window, cx)),
             speed: cx.new(|cx| SelectState::new(speed_choices(), None, window, cx)),
+            trigger: cx.new(|cx| SelectState::new(trigger_choices(), None, window, cx)),
             command: cx.new(|cx| InputState::new(window, cx).placeholder("loginctl lock-session")),
             background: cx.new(|cx| ColorPickerState::new(window, cx)),
             spec: ImageSpec::default(),
@@ -909,6 +940,7 @@ impl RustyDeckShell {
             None => AnimationKind::None,
         };
         let speed = stored.as_ref().map(|animation| animation.speed).unwrap_or(Speed::Normal);
+        let trigger = stored.as_ref().map(|animation| animation.trigger).unwrap_or(Trigger::Always);
 
         form.update(cx, |form, cx| {
             // Items first: `set_items` swaps the list without touching the selection, so selecting
@@ -919,6 +951,7 @@ impl RustyDeckShell {
             });
             form.animation.update(cx, |state, cx| state.set_selected_value(&animation_kind, window, cx));
             form.speed.update(cx, |state, cx| state.set_selected_value(&speed, window, cx));
+            form.trigger.update(cx, |state, cx| state.set_selected_value(&trigger, window, cx));
             form.name
                 .update(cx, |state, cx| state.set_value(existing.as_ref().map(|a| a.name().to_owned()).unwrap_or_default(), window, cx));
             form.command
@@ -962,6 +995,7 @@ impl RustyDeckShell {
             let background_state = form.read(cx).background.clone();
             let animation_state = form.read(cx).animation.clone();
             let speed_state = form.read(cx).speed.clone();
+            let trigger_state = form.read(cx).trigger.clone();
             // Speed only means something once there is something to play.
             let animated = !matches!(animation_state.read(cx).selected_value(), Some(AnimationKind::None) | None);
             let preview = form.read(cx).preview();
@@ -1040,7 +1074,10 @@ impl RustyDeckShell {
                                 })),
                         ))
                         .child(field("Animation", Select::new(&animation_state).placeholder("None")))
-                        .when(animated, |body| body.child(field("Speed", Select::new(&speed_state))))
+                        .when(animated, |body| {
+                            body.child(field("Speed", Select::new(&speed_state)))
+                                .child(field("Plays", Select::new(&trigger_state)))
+                        })
                         // Compositing happens on a worker, so say that it is happening rather than
                         // leaving the dialog looking inert.
                         .when(probing, |body| {
@@ -1079,6 +1116,7 @@ impl RustyDeckShell {
                         Some(AnimationKind::Generated(effect)) => Some(Animation {
                             effect: *effect,
                             speed: speed_state.read(cx).selected_value().copied().unwrap_or(Speed::Normal),
+                            trigger: trigger_state.read(cx).selected_value().copied().unwrap_or(Trigger::Always),
                         }),
                         _ => None,
                     };
@@ -1169,6 +1207,10 @@ impl RustyDeckShell {
                 }
                 cx.notify();
             });
+
+            // The frames on disk have just been rewritten, so anything already rendered from them
+            // is stale for exactly the same reason the GPUI asset cache above is.
+            crate::bridge(crate::animation::forget_frames()).await;
 
             // Slots already carrying this action need re-pushing so the hardware follows too.
             reload_profile(&this, cx).await;

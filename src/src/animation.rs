@@ -148,11 +148,39 @@ impl Speed {
 	}
 }
 
+/// What makes an animation play.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+	/// Loops for as long as the page is showing.
+	Always,
+	/// Runs once when the physical control is pressed, then settles back to the still.
+	OnPress,
+}
+
+impl Trigger {
+	pub const ALL: &'static [Trigger] = &[Trigger::Always, Trigger::OnPress];
+
+	pub fn label(&self) -> &'static str {
+		match self {
+			Trigger::Always => "Always",
+			Trigger::OnPress => "On press",
+		}
+	}
+}
+
 /// What an action's animation is, stored alongside the rest of its configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Animation {
 	pub effect: Effect,
 	pub speed: Speed,
+	/// Older configs predate triggers and were all ambient, so that is what they default to.
+	#[serde(default = "always")]
+	pub trigger: Trigger,
+}
+
+fn always() -> Trigger {
+	Trigger::Always
 }
 
 impl Animation {
@@ -203,13 +231,6 @@ struct Slot {
 	/// The size the device wants this surface at.
 	size: (u32, u32),
 	frames: usize,
-	/// Each frame's rendered bytes, filled in on the cycle that first shows it.
-	///
-	/// Rendering a frame costs about 7 ms for a key and 10 ms for a strip segment - twice what
-	/// putting it on the wire costs. Doing that every time round the loop would be the bulk of the
-	/// frame budget spent redrawing pictures that never change. One cycle warms the cache and every
-	/// cycle after it is wire time alone.
-	rendered: Vec<Option<String>>,
 	/// This slot's own rate, which may be slower than the device's tick.
 	interval: std::time::Duration,
 	elapsed: std::time::Duration,
@@ -223,6 +244,52 @@ impl Slot {
 }
 
 static PLAYERS: LazyLock<Mutex<HashMap<String, JoinHandle<()>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Frames already rendered for the wire, keyed by what makes one unique.
+///
+/// Shared rather than per-slot so a press effect is not slow the first time it fires: the ambient
+/// warm-up, a second slot using the same action, and every later press all draw from the same
+/// entries. Rendering a frame costs about 7 ms for a key and 10 ms for a strip segment, against
+/// 3.5 ms and 9.7 ms to put it on the wire, so a cache miss is the expensive case by a distance.
+type FrameKey = (std::path::PathBuf, bool, usize);
+static FRAME_CACHE: LazyLock<Mutex<HashMap<FrameKey, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Forget every rendered frame. Called when the library changes, since an edited action's frames
+/// are rewritten underneath the cache and the old ones would otherwise keep playing.
+pub async fn forget_frames() {
+	FRAME_CACHE.lock().await.clear();
+}
+
+/// One frame of one face, rendered for the device and remembered.
+async fn frame_image(directory: &std::path::Path, strip: bool, index: usize, state: &crate::shared::ActionState, size: (u32, u32)) -> Option<String> {
+	let key = (directory.to_path_buf(), strip, index);
+	if let Some(cached) = FRAME_CACHE.lock().await.get(&key) {
+		return Some(cached.clone());
+	}
+
+	// Through the still renderer, not around it: `update_image` takes an encoded data URL, and
+	// going the same way the stills do means the background, the scale and the encoder region
+	// handling are whatever the resting frame already got right.
+	let mut state = state.clone();
+	state.image = crate::custom_actions::frame_file(directory, strip, index).to_string_lossy().into_owned();
+
+	let (width, height) = size;
+	let rendered = tokio::task::spawn_blocking(move || crate::device_render::render_state(&state, width, height)).await;
+	let image = match rendered {
+		Ok(Ok(image)) => image,
+		Ok(Err(error)) => {
+			log::warn!("Failed to render animation frame: {error}");
+			return None;
+		}
+		Err(error) => {
+			log::warn!("Animation frame render panicked: {error}");
+			return None;
+		}
+	};
+
+	FRAME_CACHE.lock().await.insert(key, image.clone());
+	Some(image)
+}
 
 /// Stop whatever is animating on a device.
 ///
@@ -274,6 +341,47 @@ pub async fn start(device: DeviceInfo, profile: Profile) {
 	PLAYERS.lock().await.insert(device_id, handle);
 }
 
+/// Play a slot's effect once, from the still and back to it.
+///
+/// The launcher feel: the control is pressed, the artwork does its thing, and it settles. Nothing
+/// is left running afterwards, and frame zero is the still, so settling is just showing it again.
+///
+/// Deliberately fire-and-forget on the runtime rather than awaited by the press handler - the
+/// command a key runs must not wait for its animation to finish.
+pub fn press(context: SlotContext, instance: &crate::shared::ActionInstance) {
+	let Some(id) = instance.settings.get("rustydeck_custom").and_then(|value| value.as_str()) else {
+		return;
+	};
+
+	let mut library = crate::custom_actions::load();
+	library.extend(crate::custom_actions::load_predefined());
+	let Some(action) = library.into_iter().find(|candidate| candidate.id() == id) else { return };
+	let Some(animation) = action.config.animation.clone().filter(|a| a.trigger == Trigger::OnPress) else {
+		return;
+	};
+
+	let Some(state) = instance.states.get(instance.current_state as usize).cloned() else { return };
+	let strip = context.controller == "Encoder";
+	let size = if strip { ENCODER_IMAGE } else { KEY_IMAGE };
+	let directory = action.directory();
+
+	crate::spawn(async move {
+		let mut timer = tokio::time::interval(animation.interval());
+		// Frame zero is the still already on the key, so the run starts at one and ends by putting
+		// it back - that final write is what settles the key rather than leaving it mid-effect.
+		for index in 1..animation.frame_count() {
+			timer.tick().await;
+			let Some(image) = frame_image(&directory, strip, index, &state, size).await else { break };
+			crate::events::frontend::instances::update_image(context.clone(), Some(image)).await;
+		}
+
+		timer.tick().await;
+		if let Some(image) = frame_image(&directory, strip, 0, &state, size).await {
+			crate::events::frontend::instances::update_image(context, Some(image)).await;
+		}
+	});
+}
+
 /// Every slot on the profile whose action carries an effect.
 fn collect_slots(device: &DeviceInfo, profile: &Profile) -> Vec<Slot> {
 	let mut library = crate::custom_actions::load();
@@ -297,6 +405,11 @@ fn collect_slots(device: &DeviceInfo, profile: &Profile) -> Vec<Slot> {
 			};
 			let Some(action) = library.iter().find(|candidate| candidate.id() == id) else { continue };
 			let Some(animation) = action.config.animation.as_ref() else { continue };
+			// A press effect is not part of the loop - it runs once, when the control is pressed,
+			// and spends no budget in between.
+			if animation.trigger != Trigger::Always {
+				continue;
+			}
 
 			let Some(state) = instance.states.get(instance.current_state as usize).cloned() else { continue };
 
@@ -312,7 +425,6 @@ fn collect_slots(device: &DeviceInfo, profile: &Profile) -> Vec<Slot> {
 				state,
 				size: if controller == "Encoder" { ENCODER_IMAGE } else { KEY_IMAGE },
 				frames: animation.frame_count(),
-				rendered: vec![None; animation.frame_count()],
 				interval: animation.interval(),
 				elapsed: std::time::Duration::ZERO,
 				index: 0,
@@ -341,36 +453,9 @@ async fn run(mut slots: Vec<Slot>, fps: u16) {
 			slot.elapsed = std::time::Duration::ZERO;
 			slot.index = (slot.index + 1) % slot.frames.max(1);
 
-			let image = match &slot.rendered[slot.index] {
-				Some(image) => image.clone(),
-				None => {
-					// Through the still renderer, not around it: `update_image` takes an encoded
-					// data URL, and going the same way the stills do means the background, the
-					// scale and the encoder region handling are whatever the resting frame already
-					// got right. Compositing is CPU work, so it goes to a blocking worker.
-					let mut state = slot.state.clone();
-					state.image = crate::custom_actions::frame_file(&slot.directory, slot.strip, slot.index)
-						.to_string_lossy()
-						.into_owned();
-
-					let (width, height) = slot.size;
-					match tokio::task::spawn_blocking(move || crate::device_render::render_state(&state, width, height)).await {
-						Ok(Ok(image)) => {
-							slot.rendered[slot.index] = Some(image.clone());
-							image
-						}
-						Ok(Err(error)) => {
-							log::warn!("Failed to render animation frame: {error}");
-							continue;
-						}
-						Err(error) => {
-							log::warn!("Animation frame render panicked: {error}");
-							continue;
-						}
-					}
-				}
+			let Some(image) = frame_image(&slot.directory, slot.strip, slot.index, &slot.state, slot.size).await else {
+				continue;
 			};
-
 			crate::events::frontend::instances::update_image(slot.context.clone(), Some(image)).await;
 		}
 	}

@@ -43,6 +43,10 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 
 	let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
 
+	// The press effect goes first and does not block: it is what the key looks like while whatever
+	// it does happens, so waiting for the command would defeat the point of it.
+	crate::animation::press(context.clone(), instance);
+
 	if let Some(delta) = page_step_for(&instance.action.uuid) {
 		drop(locks);
 		let device = device.to_owned();
