@@ -639,7 +639,7 @@ impl RustyDeckShell {
         let this = cx.entity().downgrade();
         let title = SharedString::from(format!("Dial {}", dial + 1));
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let this = this.clone();
             let ok_form = form.clone();
             let kind_state = form.read(cx).kind.clone();
@@ -657,6 +657,9 @@ impl RustyDeckShell {
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
                 .child(
                     v_flex()
+                        .id("dial-form")
+                        .max_h(form_max_height(window))
+                        .overflow_y_scroll()
                         .gap_3()
                         .p_2()
                         .child(field("Action", Select::new(&kind_state).placeholder("Choose an action")))
@@ -981,7 +984,7 @@ impl RustyDeckShell {
         let this = cx.entity().downgrade();
         let title = if edit.is_some() { "Edit action" } else { "Create action" };
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let this = this.clone();
             let clear_form = form.clone();
             let pick_image = form.clone();
@@ -1021,6 +1024,11 @@ impl RustyDeckShell {
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
                 .child(
                     v_flex()
+                        // Scrolls rather than overflowing when the window is too short for every
+                        // field. Needs an id: scroll position is element state.
+                        .id("action-form")
+                        .max_h(form_max_height(window))
+                        .overflow_y_scroll()
                         .gap_3()
                         .p_2()
                         .child(field("Name", Input::new(&name_state).border_color(required(name_blank, cx))))
@@ -1834,6 +1842,27 @@ fn required(blank: bool, cx: &App) -> gpui::Hsla {
 /// A labelled form field in the create dialog.
 fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
     v_flex().gap_1().child(div().text_sm().child(label)).child(control)
+}
+
+/// How tall a dialog's fields may be before they scroll.
+///
+/// A dialog grows with the fields in it and the window does not: the create form is eight fields
+/// tall now, and in a short window the last of them - along with the footer holding Save - had
+/// nowhere to go. Bounded against the viewport rather than a fixed number, so a tall window still
+/// shows the whole form with no scrollbar at all.
+///
+/// A fraction rather than the height minus a constant, because the constant would have to be the
+/// dialog's title, its footer, its padding *and* the margin it keeps off the window edge - four
+/// numbers owned by the component library, any of which can change under us. A share of the window
+/// needs none of them and cannot drift.
+///
+/// The floor stops a very short window collapsing the fields to nothing, which would be worse than
+/// the overflow it is meant to fix.
+fn form_max_height(window: &Window) -> gpui::Pixels {
+    const SHARE: f32 = 0.62;
+    const FLOOR: f32 = 200.0;
+    let height: f32 = window.viewport_size().height.into();
+    px((height * SHARE).max(FLOOR))
 }
 
 /// Ask for a file without blocking the UI thread - the blocking `rfd::FileDialog` used elsewhere
