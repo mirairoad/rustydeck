@@ -62,15 +62,48 @@ development. Your own crate stays unoptimised and debuggable.
 ## Installing
 
 ```sh
-sudo install -Dm755 src/target/release/rustydeck /usr/local/bin/rustydeck
-sudo install -Dm644 src/bundle/40-streamdeck.rules /usr/lib/udev/rules.d/40-streamdeck.rules
-sudo install -Dm644 src/bundle/rustydeck.desktop  /usr/share/applications/rustydeck.desktop
-sudo install -Dm644 src/icons/icon.png            /usr/share/icons/hicolor/512x512/apps/rustydeck.png
+curl -fsSL https://raw.githubusercontent.com/mirairoad/rustydeck/main/install.sh | bash
+```
+
+That fetches the source, builds it, and installs the binary, the udev rules, the
+desktop entry and the icon. It asks for `sudo` only for the install step, never
+for the build. `--uninstall` removes all four again and leaves your
+configuration alone.
+
+If you would rather read a script before running it - and you should - fetch it
+first:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/mirairoad/rustydeck/main/install.sh
+less install.sh && bash install.sh
+```
+
+It builds from source rather than downloading a binary, and that is deliberate.
+The binary links against a particular ICU soname - `libicuuc.so.78` on Arch
+today, `.74` on Ubuntu 24.04 - so one built elsewhere would refuse to start
+here. Compiling on the machine it will run on links against whatever is actually
+installed. The whole of that dependency chain, GTK included, arrives through the
+tray icon; nothing else in the app needs it.
+
+The script checks its build dependencies first and prints the one command that
+installs the missing ones for Arch, Debian/Ubuntu or Fedora. It will not install
+system packages for you: a script piped from the internet is the last thing that
+should be making that decision quietly.
+
+### By hand
+
+```sh
+cd src && cargo build --release
+sudo install -Dm755 target/release/rustydeck /usr/local/bin/rustydeck
+sudo install -Dm644 bundle/40-streamdeck.rules /usr/lib/udev/rules.d/40-streamdeck.rules
+sudo install -Dm644 bundle/rustydeck.desktop  /usr/share/applications/rustydeck.desktop
+sudo install -Dm644 icons/icon.png            /usr/share/icons/hicolor/512x512/apps/rustydeck.png
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 The udev rules are what let the app open the device without root. Replug the
-deck after installing them.
+deck after installing them - without them it enumerates and then refuses to
+talk, which looks like a broken app rather than a permissions problem.
 
 Configuration lives in `~/.rustydeck`: `profiles/` (one file per device plus a
 directory of pages), `customs/` and `predefined/` (action libraries, each action
