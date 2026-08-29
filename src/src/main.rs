@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions, prelude::*, px, size};
+use gpui::{App, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowHandle, WindowOptions, prelude::*, px, size};
 use gpui_component::Root;
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -251,6 +251,10 @@ fn run_window_session() {
 		gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
 
 		let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+		// Nearly all of the delay between asking for the window and seeing it is inside this call -
+		// GPUI building its renderer and text system from scratch, the same ~1.8s the app pays on a
+		// cold start. Worth keeping an eye on, since it is now paid on every Show.
+		let _open = shared::Timed::start("open_window");
 		let window = cx
 			.open_window(
 				WindowOptions {
@@ -263,6 +267,19 @@ fn run_window_session() {
 					// and the `StartupWMClass` in our desktop entry all match on this, and without
 					// it the window arrives anonymous and none of them can name it.
 					app_id: Some(APP_ID.into()),
+					// Declared transparent purely to halve how long the window takes to appear.
+					// GPUI always creates a Wayland surface with `transparent: true` and compiles
+					// the whole Blade pipeline set against it, then on the first frame notices an
+					// opaque window and destroys and recompiles the lot - about 0.9s of shader
+					// compilation, paid twice. Agreeing with how the surface was created skips the
+					// second pass. The shell paints an opaque background over the full window, so
+					// nothing shows through.
+					// ... and paired with client-side decorations, which is the other half of it:
+					// with server-side decorations the compositor's answer arrives after the window
+					// is built and flips the surface opaque, costing a third compile. Hyprland draws
+					// no titlebar either way, so nothing is given up by owning them.
+					window_background: WindowBackgroundAppearance::Transparent,
+					window_decorations: Some(WindowDecorations::Client),
 					..Default::default()
 				},
 				|window, cx| {
@@ -283,6 +300,8 @@ fn run_window_session() {
 				},
 			)
 			.expect("failed to open the main window");
+
+		drop(_open);
 
 		cx.activate(true);
 		watch_window_requests(window, cx);
