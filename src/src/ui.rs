@@ -2,6 +2,7 @@
 //! and the device's slots with drag-to-reposition and drag-to-swap (the defect this rewrite exists
 //! to fix - see PRD §3).
 
+use crate::animation::{Animation, Effect, Speed, Trigger};
 use crate::custom_actions::{self, CustomAction, ImageSpec};
 use crate::device_render::{render_state, resolve_image_path};
 use crate::events::frontend;
@@ -200,6 +201,119 @@ fn action_choices(categories: &[(String, Category)]) -> Vec<ActionChoice> {
     choices
 }
 
+/// What the animation picker offers: no animation, or one of the generated effects.
+#[derive(Clone, PartialEq)]
+enum AnimationKind {
+    None,
+    Generated(Effect),
+}
+
+#[derive(Clone)]
+struct AnimationChoice {
+    label: SharedString,
+    kind: AnimationKind,
+}
+
+impl SelectItem for AnimationChoice {
+    type Value = AnimationKind;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.kind
+    }
+}
+
+/// "None" first, then every generated effect.
+///
+/// Generated rather than imported: an effect is computed from the artwork the action already has,
+/// so it needs no second file and works on a library that was built before animation existed.
+fn animation_choices() -> Vec<AnimationChoice> {
+    let mut choices = vec![AnimationChoice {
+        label: "None".into(),
+        kind: AnimationKind::None,
+    }];
+    choices.extend(Effect::ALL.iter().map(|effect| AnimationChoice {
+        label: SharedString::from(effect.label()),
+        kind: AnimationKind::Generated(*effect),
+    }));
+    choices
+}
+
+#[derive(Clone)]
+struct TriggerChoice {
+    label: SharedString,
+    trigger: Trigger,
+}
+
+impl SelectItem for TriggerChoice {
+    type Value = Trigger;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.trigger
+    }
+}
+
+fn trigger_choices() -> Vec<TriggerChoice> {
+    Trigger::ALL
+        .iter()
+        .map(|trigger| TriggerChoice {
+            label: SharedString::from(trigger.label()),
+            trigger: *trigger,
+        })
+        .collect()
+}
+
+#[derive(Clone)]
+struct SpeedChoice {
+    label: SharedString,
+    speed: Speed,
+}
+
+impl SelectItem for SpeedChoice {
+    type Value = Speed;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.speed
+    }
+}
+
+fn speed_choices() -> Vec<SpeedChoice> {
+    Speed::ALL
+        .iter()
+        .map(|speed| SpeedChoice {
+            label: SharedString::from(format!("{} - {} fps", speed.label(), speed.fps())),
+            speed: *speed,
+        })
+        .collect()
+}
+
+/// Everything the form collected, on its way to being written.
+///
+/// A struct rather than a parameter list: the same six values travel together from the dialog's
+/// Save through to the worker, and named fields at the call site beat six positional arguments
+/// where three of them are `Option<String>`.
+struct ActionDraft {
+    name: String,
+    command: String,
+    /// The built-in action to place instead of Run Command, if one was chosen.
+    builtin: Option<String>,
+    animation: Option<Animation>,
+    spec: ImageSpec,
+    /// The slug being edited, or `None` when creating.
+    editing: Option<String>,
+}
+
 /// Transient state of the create/edit form.
 ///
 /// Deliberately its own entity rather than fields on the shell: the dialog's builder closure runs
@@ -210,6 +324,12 @@ struct ActionForm {
     name: Entity<InputState>,
     /// Whether this entry runs a command or places a built-in action.
     kind: Entity<SelectState<Vec<ActionChoice>>>,
+    /// Which effect the artwork plays, if any.
+    animation: Entity<SelectState<Vec<AnimationChoice>>>,
+    /// How fast it plays. Only shown once an effect is chosen.
+    speed: Entity<SelectState<Vec<SpeedChoice>>>,
+    /// Whether it loops or runs once on a press.
+    trigger: Entity<SelectState<Vec<TriggerChoice>>>,
     command: Entity<InputState>,
     background: Entity<ColorPickerState>,
     spec: ImageSpec,
@@ -394,6 +514,9 @@ impl RustyDeckShell {
             // The catalogue has not loaded yet, so this starts with only "Run command" and is
             // refilled from it each time the dialog opens.
             kind: cx.new(|cx| SelectState::new(action_choices(&[]), None, window, cx)),
+            animation: cx.new(|cx| SelectState::new(animation_choices(), None, window, cx)),
+            speed: cx.new(|cx| SelectState::new(speed_choices(), None, window, cx)),
+            trigger: cx.new(|cx| SelectState::new(trigger_choices(), None, window, cx)),
             command: cx.new(|cx| InputState::new(window, cx).placeholder("loginctl lock-session")),
             background: cx.new(|cx| ColorPickerState::new(window, cx)),
             spec: ImageSpec::default(),
@@ -410,6 +533,12 @@ impl RustyDeckShell {
         // that only shows if the shell redraws.
         let action_kind = form.read(cx).kind.clone();
         cx.subscribe(&action_kind, |_this, _state, _event: &SelectEvent<Vec<ActionChoice>>, cx| cx.notify())
+            .detach();
+
+        // Choosing an effect reveals the speed field, and the previews start playing - neither
+        // happens unless the shell is told to draw again.
+        let animation_kind = form.read(cx).animation.clone();
+        cx.subscribe(&animation_kind, |_this, _state, _event: &SelectEvent<Vec<AnimationChoice>>, cx| cx.notify())
             .detach();
 
         Self {
@@ -510,7 +639,7 @@ impl RustyDeckShell {
         let this = cx.entity().downgrade();
         let title = SharedString::from(format!("Dial {}", dial + 1));
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let this = this.clone();
             let ok_form = form.clone();
             let kind_state = form.read(cx).kind.clone();
@@ -528,6 +657,9 @@ impl RustyDeckShell {
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
                 .child(
                     v_flex()
+                        .id("dial-form")
+                        .max_h(form_max_height(window))
+                        .overflow_y_scroll()
                         .gap_3()
                         .p_2()
                         .child(field("Action", Select::new(&kind_state).placeholder("Choose an action")))
@@ -805,6 +937,14 @@ impl RustyDeckShell {
             None => ActionKind::Command,
         };
 
+        let stored = existing.as_ref().and_then(|action| action.config.animation.clone());
+        let animation_kind = match &stored {
+            Some(animation) => AnimationKind::Generated(animation.effect),
+            None => AnimationKind::None,
+        };
+        let speed = stored.as_ref().map(|animation| animation.speed).unwrap_or(Speed::Normal);
+        let trigger = stored.as_ref().map(|animation| animation.trigger).unwrap_or(Trigger::Always);
+
         form.update(cx, |form, cx| {
             // Items first: `set_items` swaps the list without touching the selection, so selecting
             // before refilling would look up the value in the old list.
@@ -812,6 +952,9 @@ impl RustyDeckShell {
                 state.set_items(kinds, window, cx);
                 state.set_selected_value(&kind, window, cx);
             });
+            form.animation.update(cx, |state, cx| state.set_selected_value(&animation_kind, window, cx));
+            form.speed.update(cx, |state, cx| state.set_selected_value(&speed, window, cx));
+            form.trigger.update(cx, |state, cx| state.set_selected_value(&trigger, window, cx));
             form.name
                 .update(cx, |state, cx| state.set_value(existing.as_ref().map(|a| a.name().to_owned()).unwrap_or_default(), window, cx));
             form.command
@@ -841,7 +984,7 @@ impl RustyDeckShell {
         let this = cx.entity().downgrade();
         let title = if edit.is_some() { "Edit action" } else { "Create action" };
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let this = this.clone();
             let clear_form = form.clone();
             let pick_image = form.clone();
@@ -853,6 +996,11 @@ impl RustyDeckShell {
             // takes nothing from this form but the artwork.
             let is_command = !matches!(kind_state.read(cx).selected_value(), Some(ActionKind::Builtin(_)));
             let background_state = form.read(cx).background.clone();
+            let animation_state = form.read(cx).animation.clone();
+            let speed_state = form.read(cx).speed.clone();
+            let trigger_state = form.read(cx).trigger.clone();
+            // Speed only means something once there is something to play.
+            let animated = !matches!(animation_state.read(cx).selected_value(), Some(AnimationKind::None) | None);
             let preview = form.read(cx).preview();
             // Show what the key will actually look like: the chosen colour behind the image, with
             // a transparent icon inset so the colour reads as a border - the same rule the
@@ -876,6 +1024,11 @@ impl RustyDeckShell {
                 .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
                 .child(
                     v_flex()
+                        // Scrolls rather than overflowing when the window is too short for every
+                        // field. Needs an id: scroll position is element state.
+                        .id("action-form")
+                        .max_h(form_max_height(window))
+                        .overflow_y_scroll()
                         .gap_3()
                         .p_2()
                         .child(field("Name", Input::new(&name_state).border_color(required(name_blank, cx))))
@@ -928,6 +1081,11 @@ impl RustyDeckShell {
                                     pick_file(pick_image.clone(), cx);
                                 })),
                         ))
+                        .child(field("Animation", Select::new(&animation_state).placeholder("None")))
+                        .when(animated, |body| {
+                            body.child(field("Speed", Select::new(&speed_state)))
+                                .child(field("Plays", Select::new(&trigger_state)))
+                        })
                         // Compositing happens on a worker, so say that it is happening rather than
                         // leaving the dialog looking inert.
                         .when(probing, |body| {
@@ -962,9 +1120,26 @@ impl RustyDeckShell {
                         return false;
                     }
 
+                    let animation = match animation_state.read(cx).selected_value() {
+                        Some(AnimationKind::Generated(effect)) => Some(Animation {
+                            effect: *effect,
+                            speed: speed_state.read(cx).selected_value().copied().unwrap_or(Speed::Normal),
+                            trigger: trigger_state.read(cx).selected_value().copied().unwrap_or(Trigger::Always),
+                        }),
+                        _ => None,
+                    };
+
                     let (mut spec, editing) = ok_form.read_with(cx, |form, _| (form.spec.clone(), form.editing.clone()));
                     spec.background = ok_form.read(cx).background.read(cx).value().map(hsla_to_hex);
-                    let _ = this.update(cx, |this, cx| this.save_custom_action(name, command, builtin, spec, editing, cx));
+                    let draft = ActionDraft {
+                        name,
+                        command,
+                        builtin,
+                        animation,
+                        spec,
+                        editing,
+                    };
+                    let _ = this.update(cx, |this, cx| this.save_custom_action(draft, cx));
                     true
                 })
         });
@@ -976,7 +1151,16 @@ impl RustyDeckShell {
     /// both faces, which on a large photo is seconds of work. Doing that inline froze the window
     /// until it finished - and because nothing else could run in the meantime, the form appeared to
     /// accept only one action per launch.
-    fn save_custom_action(&mut self, name: String, command: String, builtin: Option<String>, spec: ImageSpec, editing: Option<String>, cx: &mut Context<Self>) {
+    fn save_custom_action(&mut self, draft: ActionDraft, cx: &mut Context<Self>) {
+        let ActionDraft {
+            name,
+            command,
+            builtin,
+            animation,
+            spec,
+            editing,
+        } = draft;
+
         let form = self.form.clone();
         form.update(cx, |form, cx| {
             form.saving = true;
@@ -988,8 +1172,8 @@ impl RustyDeckShell {
             let edited = editing.clone();
             let result = crate::bridge(async move {
                 tokio::task::spawn_blocking(move || match &editing {
-                    Some(id) => custom_actions::update(id, name, command, builtin, &spec),
-                    None => custom_actions::create(name, command, builtin, &spec),
+                    Some(id) => custom_actions::update(id, name, command, builtin, animation, &spec),
+                    None => custom_actions::create(name, command, builtin, animation, &spec),
                 })
                 .await
                 .unwrap_or_else(|error| Err(anyhow::anyhow!("compositing panicked: {error}")))
@@ -1031,6 +1215,10 @@ impl RustyDeckShell {
                 }
                 cx.notify();
             });
+
+            // The frames on disk have just been rewritten, so anything already rendered from them
+            // is stale for exactly the same reason the GPUI asset cache above is.
+            crate::bridge(crate::animation::forget_frames()).await;
 
             // Slots already carrying this action need re-pushing so the hardware follows too.
             reload_profile(&this, cx).await;
@@ -1330,6 +1518,9 @@ fn push_device_images(device: DeviceInfo, profile: Profile) {
 
 async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
     let _timed = crate::shared::Timed::start("push_device_images (all slots)");
+    // Stopped before the stills go out, restarted after. A player left running would race this,
+    // writing animation frames into slots that are being reset to their resting image.
+    crate::animation::stop(&device.id).await;
     // Touchpoints live in the keypad array, appended after the keys.
     let keypad_count = (device.rows as usize) * (device.columns as usize) + device.touchpoints as usize;
 
@@ -1377,6 +1568,10 @@ async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
             frontend::instances::update_image(context, image).await;
         }
     }
+
+    // Only the page on screen animates. A page you are not looking at would spend the same frame
+    // budget for nothing, and the deck shows one page at a time.
+    crate::animation::start(device, profile).await;
 }
 
 /// Re-read the selected profile from the backend and push it to the hardware.
@@ -1647,6 +1842,27 @@ fn required(blank: bool, cx: &App) -> gpui::Hsla {
 /// A labelled form field in the create dialog.
 fn field(label: &'static str, control: impl IntoElement) -> impl IntoElement {
     v_flex().gap_1().child(div().text_sm().child(label)).child(control)
+}
+
+/// How tall a dialog's fields may be before they scroll.
+///
+/// A dialog grows with the fields in it and the window does not: the create form is eight fields
+/// tall now, and in a short window the last of them - along with the footer holding Save - had
+/// nowhere to go. Bounded against the viewport rather than a fixed number, so a tall window still
+/// shows the whole form with no scrollbar at all.
+///
+/// A fraction rather than the height minus a constant, because the constant would have to be the
+/// dialog's title, its footer, its padding *and* the margin it keeps off the window edge - four
+/// numbers owned by the component library, any of which can change under us. A share of the window
+/// needs none of them and cannot drift.
+///
+/// The floor stops a very short window collapsing the fields to nothing, which would be worse than
+/// the overflow it is meant to fix.
+fn form_max_height(window: &Window) -> gpui::Pixels {
+    const SHARE: f32 = 0.62;
+    const FLOOR: f32 = 200.0;
+    let height: f32 = window.viewport_size().height.into();
+    px((height * SHARE).max(FLOOR))
 }
 
 /// Ask for a file without blocking the UI thread - the blocking `rfd::FileDialog` used elsewhere

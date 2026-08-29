@@ -1,3 +1,4 @@
+mod animation;
 mod application_watcher;
 mod backup;
 mod custom_actions;

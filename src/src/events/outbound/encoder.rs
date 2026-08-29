@@ -61,6 +61,9 @@ pub async fn touch_tap(device: &str, index: u8, _x: u16, _y: u16, _hold: bool) -
 	};
 	let Some(instance) = get_instance_mut(&context, &mut locks).await? else { return Ok(()) };
 
+	// A tap on the rectangle is a press as far as an effect is concerned - see `keypad::key_down`.
+	crate::animation::press(context.clone().into(), instance);
+
 	if let Some(delta) = page_step_for(&instance.action.uuid) {
 		drop(locks);
 		spawn_page_step(device, delta);
