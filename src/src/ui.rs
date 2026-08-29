@@ -7,7 +7,7 @@ use crate::device_render::{render_state, resolve_image_path};
 use crate::events::frontend;
 use crate::frontend_events::{self, FrontendEvent};
 use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, Profile};
-use crate::shared::RUN_COMMAND_UUID;
+use crate::shared::{BUILTIN_PLUGIN, RUN_COMMAND_UUID};
 use crate::store::profiles::DialConfig;
 
 use std::rc::Rc;
@@ -78,14 +78,6 @@ fn simulate_press(device: &str, dial: u8) {
     let _ = (device, dial);
 }
 
-/// Simulated tap of a strip rectangle. Compiled out of a release build.
-fn simulate_tap(device: &str, position: u8) {
-    #[cfg(debug_assertions)]
-    crate::simulator::tap_strip(device, position);
-    #[cfg(not(debug_assertions))]
-    let _ = (device, position);
-}
-
 /// Whether a device is simulated. Always false in a release build, which has none.
 fn is_simulated(device_id: &str) -> bool {
     #[cfg(debug_assertions)]
@@ -128,6 +120,16 @@ struct DraggedKey {
     image: Option<String>,
 }
 
+/// A configured dial being dragged onto another dial to exchange the two.
+///
+/// Carries the position rather than the config: dials are device-scoped, so the store is the one
+/// authority on what each knob does and the swap is resolved there.
+#[derive(Clone)]
+struct DraggedDial {
+    dial: u8,
+    label: SharedString,
+}
+
 /// A palette entry being dragged onto the grid to create a new instance.
 #[derive(Clone)]
 struct DraggedAction {
@@ -140,6 +142,64 @@ struct DraggedCustomAction {
     action: CustomAction,
 }
 
+/// What a library entry does when it lands on a slot.
+#[derive(Clone, PartialEq)]
+enum ActionKind {
+    /// The user's own shell command, run through Run Command.
+    Command,
+    /// A built-in action placed as it is, named by its UUID - the entry supplies only the artwork.
+    Builtin(SharedString),
+}
+
+/// One entry in the create-action dialog's kind picker.
+#[derive(Clone)]
+struct ActionChoice {
+    label: SharedString,
+    kind: ActionKind,
+}
+
+impl SelectItem for ActionChoice {
+    type Value = ActionKind;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.kind
+    }
+}
+
+/// The picker's entries: a shell command, then every built-in action that can sit on a key.
+///
+/// Read off the registered catalogue rather than a hand-written list, so a new first-party keypad
+/// action appears here without anything being added. Three exclusions, each for its own reason:
+/// Run Command *is* the "Run command" entry; anything from another plugin namespace is an upstream
+/// leftover with no handler behind it; and an encoder-only action would be unplaceable, since a
+/// dial is configured from its own dialog rather than by dropping a library entry on it.
+fn action_choices(categories: &[(String, Category)]) -> Vec<ActionChoice> {
+    let mut choices = vec![ActionChoice {
+        label: "Run command".into(),
+        kind: ActionKind::Command,
+    }];
+
+    let mut builtins: Vec<ActionChoice> = categories
+        .iter()
+        .flat_map(|(_, category)| category.actions.iter())
+        .filter(|action| action.plugin == BUILTIN_PLUGIN && action.uuid != RUN_COMMAND_UUID)
+        .filter(|action| action.controllers.iter().any(|controller| controller == KEYPAD_CONTROLLER))
+        .map(|action| ActionChoice {
+            label: SharedString::from(action.name.clone()),
+            kind: ActionKind::Builtin(SharedString::from(action.uuid.clone())),
+        })
+        .collect();
+
+    // The catalogue is a map, so its order is not stable between runs.
+    builtins.sort_by(|a, b| a.label.cmp(&b.label));
+    choices.extend(builtins);
+    choices
+}
+
 /// Transient state of the create/edit form.
 ///
 /// Deliberately its own entity rather than fields on the shell: the dialog's builder closure runs
@@ -148,6 +208,8 @@ struct DraggedCustomAction {
 /// separate entity is fine.
 struct ActionForm {
     name: Entity<InputState>,
+    /// Whether this entry runs a command or places a built-in action.
+    kind: Entity<SelectState<Vec<ActionChoice>>>,
     command: Entity<InputState>,
     background: Entity<ColorPickerState>,
     spec: ImageSpec,
@@ -235,6 +297,8 @@ fn dial_choices() -> Vec<DialChoice> {
 /// The tap is deliberately absent: it belongs to the rectangle above the dial, which is page-scoped
 /// and configured by dropping an action onto it.
 struct DialCommands {
+    /// What to caption the knob with. Blank falls back to "Custom".
+    name: String,
     /// Turning the dial anticlockwise.
     left: String,
     /// Turning it clockwise.
@@ -250,6 +314,7 @@ struct DialForm {
     /// Which dial the open dialog is configuring.
     dial: u8,
     kind: Entity<SelectState<Vec<DialChoice>>>,
+    name: Entity<InputState>,
     left: Entity<InputState>,
     right: Entity<InputState>,
     centre: Entity<InputState>,
@@ -311,6 +376,8 @@ impl RustyDeckShell {
         let dial_form = cx.new(|cx| DialForm {
             dial: 0,
             kind: cx.new(|cx| SelectState::new(dial_choices(), None, window, cx)),
+            // Blank is a valid name, so the placeholder is the fallback caption itself.
+            name: cx.new(|cx| InputState::new(window, cx).placeholder("Custom")),
             left: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-")),
             right: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+")),
             centre: cx.new(|cx| InputState::new(window, cx).placeholder("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")),
@@ -320,6 +387,29 @@ impl RustyDeckShell {
         // reveals the command inputs if the shell is told to draw again.
         let dial_kind = dial_form.read(cx).kind.clone();
         cx.subscribe(&dial_kind, |_this, _state, _event: &SelectEvent<Vec<DialChoice>>, cx| cx.notify())
+            .detach();
+
+        let form = cx.new(|cx| ActionForm {
+            name: cx.new(|cx| InputState::new(window, cx).placeholder("Lock screen")),
+            // The catalogue has not loaded yet, so this starts with only "Run command" and is
+            // refilled from it each time the dialog opens.
+            kind: cx.new(|cx| SelectState::new(action_choices(&[]), None, window, cx)),
+            command: cx.new(|cx| InputState::new(window, cx).placeholder("loginctl lock-session")),
+            background: cx.new(|cx| ColorPickerState::new(window, cx)),
+            spec: ImageSpec::default(),
+            image_is_icon: false,
+            existing_image: None,
+            editing: None,
+            error: None,
+            invalid: false,
+            probing: false,
+            saving: false,
+        });
+
+        // Same reason as the dial picker: choosing a built-in action hides the command field, and
+        // that only shows if the shell redraws.
+        let action_kind = form.read(cx).kind.clone();
+        cx.subscribe(&action_kind, |_this, _state, _event: &SelectEvent<Vec<ActionChoice>>, cx| cx.notify())
             .detach();
 
         Self {
@@ -333,19 +423,7 @@ impl RustyDeckShell {
             device_auto_selected: false,
             pages: Vec::new(),
             current_page: String::new(),
-            form: cx.new(|cx| ActionForm {
-                name: cx.new(|cx| InputState::new(window, cx).placeholder("Lock screen")),
-                command: cx.new(|cx| InputState::new(window, cx).placeholder("loginctl lock-session")),
-                background: cx.new(|cx| ColorPickerState::new(window, cx)),
-                spec: ImageSpec::default(),
-                image_is_icon: false,
-                existing_image: None,
-                editing: None,
-                error: None,
-                invalid: false,
-                probing: false,
-                saving: false,
-            }),
+            form,
             dial_form,
             dials: Vec::new(),
             row_menu_open: None,
@@ -414,15 +492,16 @@ impl RustyDeckShell {
 
         // Prefill from what the dial already does, so opening the modal and saving without
         // touching anything leaves it exactly as it was.
-        let (left, right, centre) = match &existing {
-            Some(DialConfig::Custom { left, right, centre }) => (left.clone(), right.clone(), centre.clone()),
-            _ => (String::new(), String::new(), String::new()),
+        let (name, left, right, centre) = match &existing {
+            Some(DialConfig::Custom { name, left, right, centre }) => (name.clone(), left.clone(), right.clone(), centre.clone()),
+            _ => (String::new(), String::new(), String::new(), String::new()),
         };
 
         let form = self.dial_form.clone();
         form.update(cx, |form, cx| {
             form.dial = dial;
             form.kind.update(cx, |state, cx| state.set_selected_value(&kind, window, cx));
+            form.name.update(cx, |state, cx| state.set_value(name, window, cx));
             form.left.update(cx, |state, cx| state.set_value(left, window, cx));
             form.right.update(cx, |state, cx| state.set_value(right, window, cx));
             form.centre.update(cx, |state, cx| state.set_value(centre, window, cx));
@@ -435,6 +514,7 @@ impl RustyDeckShell {
             let this = this.clone();
             let ok_form = form.clone();
             let kind_state = form.read(cx).kind.clone();
+            let name_state = form.read(cx).name.clone();
             let left_state = form.read(cx).left.clone();
             let right_state = form.read(cx).right.clone();
             let centre_state = form.read(cx).centre.clone();
@@ -452,7 +532,8 @@ impl RustyDeckShell {
                         .p_2()
                         .child(field("Action", Select::new(&kind_state).placeholder("Choose an action")))
                         .when(is_custom, |body| {
-                            body.child(field("Left", Input::new(&left_state)))
+                            body.child(field("Name", Input::new(&name_state)))
+                                .child(field("Left", Input::new(&left_state)))
                                 .child(field("Right", Input::new(&right_state)))
                                 .child(field("Centre", Input::new(&centre_state)))
                         })
@@ -466,6 +547,7 @@ impl RustyDeckShell {
                 .on_ok(move |_event, _window, cx| {
                     let kind = kind_state.read(cx).selected_value().cloned().unwrap_or(DialKind::None);
                     let commands = DialCommands {
+                        name: name_state.read(cx).value().trim().to_string(),
                         left: left_state.read(cx).value().to_string(),
                         right: right_state.read(cx).value().to_string(),
                         centre: centre_state.read(cx).value().to_string(),
@@ -481,6 +563,8 @@ impl RustyDeckShell {
     fn dial_label(&self, dial: u8) -> SharedString {
         match self.dials.get(dial as usize).and_then(|slot| slot.as_ref()) {
             None => SharedString::from("Unset"),
+            // A name is optional, so an unnamed custom dial keeps the caption it always had.
+            Some(DialConfig::Custom { name, .. }) if !name.is_empty() => SharedString::from(name.clone()),
             Some(DialConfig::Custom { .. }) => SharedString::from("Custom"),
             Some(DialConfig::System { uuid }) => crate::system_actions::CATALOGUE
                 .iter()
@@ -497,12 +581,42 @@ impl RustyDeckShell {
             dial,
             DialKind::None,
             DialCommands {
+                name: String::new(),
                 left: String::new(),
                 right: String::new(),
                 centre: String::new(),
             },
             cx,
         );
+    }
+
+    /// Exchange what two dials do, from dragging one knob onto another.
+    ///
+    /// Always a swap rather than a move: a dial is its position on the device, so the destination's
+    /// config has to go somewhere, and the source is the only knob free to take it. Dropping onto
+    /// an unset dial is how one gets moved.
+    fn swap_dials(&mut self, source: u8, destination: u8, cx: &mut Context<Self>) {
+        if source == destination {
+            return;
+        }
+
+        let Some(device) = self.device.as_ref() else { return };
+        let (id, encoders) = (device.id.clone(), device.encoders as usize);
+
+        cx.spawn(async move |this, cx| {
+            let result = crate::bridge(async move {
+                let mut locks = crate::store::profiles::acquire_locks_mut().await;
+                locks.device_stores.swap_dials(&id, encoders, source, destination)
+            })
+            .await;
+
+            if let Err(error) = result {
+                log::error!("Failed to swap dials {source} and {destination}: {error}");
+                return;
+            }
+            reload_dials(&this, cx).await;
+        })
+        .detach();
     }
 
     /// Save the dial dialog's result to the device's own store.
@@ -514,6 +628,7 @@ impl RustyDeckShell {
             DialKind::None => None,
             DialKind::System(uuid) => Some(DialConfig::System { uuid: uuid.to_string() }),
             DialKind::Custom => Some(DialConfig::Custom {
+                name: commands.name,
                 left: commands.left,
                 right: commands.right,
                 centre: commands.centre,
@@ -532,6 +647,127 @@ impl RustyDeckShell {
                 return;
             }
             reload_dials(&this, cx).await;
+        })
+        .detach();
+    }
+
+    /// A one-message dialog, for reporting something that finished without one.
+    fn notice(&self, title: &'static str, message: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let message = message.clone();
+            dialog
+                .title(title)
+                .button_props(DialogButtonProps::default().ok_text("OK"))
+                // Footer buttons only render when a footer is set - see `open_action_dialog`.
+                .footer(|ok, _cancel, window, cx| vec![ok(window, cx)])
+                .child(div().p_2().text_sm().text_color(cx.theme().foreground).child(message))
+        });
+    }
+
+    /// Write every part of the configuration to a zip the user names.
+    fn export_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_file_name(crate::backup::archive_name())
+                .add_filter("Backup", &["zip"])
+                .save_file()
+                .await
+            else {
+                return;
+            };
+
+            let destination = handle.path().to_path_buf();
+            let result = crate::bridge(crate::backup::export(destination.clone())).await;
+
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => this.notice("Backup saved", SharedString::from(format!("Saved to {}", destination.display())), window, cx),
+                Err(error) => this.notice("Backup failed", SharedString::from(error.to_string()), window, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Pick a backup to restore from, then ask before replacing anything.
+    fn choose_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let Some(handle) = rfd::AsyncFileDialog::new().add_filter("Backup", &["zip"]).pick_file().await else {
+                return;
+            };
+
+            let archive = handle.path().to_path_buf();
+            let _ = this.update_in(cx, |this, window, cx| this.confirm_restore(archive, window, cx));
+        })
+        .detach();
+    }
+
+    /// Confirm a restore before it happens.
+    ///
+    /// This replaces the whole configuration rather than merging into it, which is not something to
+    /// discover afterwards - so it is spelled out, and the button says what it does.
+    fn confirm_restore(&mut self, archive: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let name = SharedString::from(archive.file_name().unwrap_or_default().to_string_lossy().into_owned());
+
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let this = this.clone();
+            let archive = archive.clone();
+            let name = name.clone();
+
+            dialog
+                .title("Restore from backup")
+                .button_props(DialogButtonProps::default().ok_text("Replace everything").cancel_text("Cancel"))
+                .footer(|ok, cancel, window, cx| vec![cancel(window, cx), ok(window, cx)])
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .p_2()
+                        .child(div().text_sm().text_color(cx.theme().foreground).child(name))
+                        .child(div().text_sm().text_color(cx.theme().muted_foreground).child(
+                            "Every action, image, dial and page is replaced by what this backup holds. Your current configuration is moved aside, not deleted - the restore will say where.",
+                        )),
+                )
+                .on_ok(move |_event, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.run_restore(archive.clone(), window, cx));
+                    true
+                })
+        });
+    }
+
+    /// Replace the configuration, then rebuild everything on screen from what landed on disk.
+    fn run_restore(&mut self, archive: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+            let result = crate::bridge(crate::backup::restore(archive)).await;
+
+            let aside = match result {
+                Ok(aside) => aside,
+                Err(error) => {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.notice("Restore failed", SharedString::from(error.to_string()), window, cx);
+                    });
+                    return;
+                }
+            };
+
+            // The stores were dropped as part of the swap, so everything held here is now stale:
+            // the library, the catalogue, the visible profile, the dials, and the artwork on the
+            // deck itself. Rebuild all of it from the restored files.
+            let _ = this.update(cx, |this, cx| {
+                this.custom = custom_actions::load();
+                this.predefined = custom_actions::load_predefined();
+                cx.notify();
+            });
+            refresh_catalogue(&this, cx).await;
+            reload_profile(&this, cx).await;
+            reload_dials(&this, cx).await;
+
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.notice(
+                    "Restored",
+                    SharedString::from(format!("Your previous configuration was moved to {}", aside.display())),
+                    window,
+                    cx,
+                );
+            });
         })
         .detach();
     }
@@ -562,7 +798,20 @@ impl RustyDeckShell {
         let existing = edit.clone();
         let form = self.form.clone();
 
+        // Built from the live catalogue, which is empty when the shell is constructed.
+        let kinds = action_choices(&self.categories);
+        let kind = match existing.as_ref().and_then(|action| action.action_uuid()) {
+            Some(uuid) => ActionKind::Builtin(SharedString::from(uuid.to_owned())),
+            None => ActionKind::Command,
+        };
+
         form.update(cx, |form, cx| {
+            // Items first: `set_items` swaps the list without touching the selection, so selecting
+            // before refilling would look up the value in the old list.
+            form.kind.update(cx, |state, cx| {
+                state.set_items(kinds, window, cx);
+                state.set_selected_value(&kind, window, cx);
+            });
             form.name
                 .update(cx, |state, cx| state.set_value(existing.as_ref().map(|a| a.name().to_owned()).unwrap_or_default(), window, cx));
             form.command
@@ -598,7 +847,11 @@ impl RustyDeckShell {
             let pick_image = form.clone();
             let ok_form = form.clone();
             let name_state = form.read(cx).name.clone();
+            let kind_state = form.read(cx).kind.clone();
             let command_state = form.read(cx).command.clone();
+            // Only a command entry takes a command; a built-in action carries its own behaviour and
+            // takes nothing from this form but the artwork.
+            let is_command = !matches!(kind_state.read(cx).selected_value(), Some(ActionKind::Builtin(_)));
             let background_state = form.read(cx).background.clone();
             let preview = form.read(cx).preview();
             // Show what the key will actually look like: the chosen colour behind the image, with
@@ -613,7 +866,7 @@ impl RustyDeckShell {
             // covered in red is shouting before the user has done anything wrong.
             let invalid = form.read(cx).invalid;
             let name_blank = invalid && name_state.read(cx).value().trim().is_empty();
-            let command_blank = invalid && command_state.read(cx).value().trim().is_empty();
+            let command_blank = invalid && is_command && command_state.read(cx).value().trim().is_empty();
 
             dialog
                 .title(title)
@@ -626,7 +879,10 @@ impl RustyDeckShell {
                         .gap_3()
                         .p_2()
                         .child(field("Name", Input::new(&name_state).border_color(required(name_blank, cx))))
-                        .child(field("Command", Input::new(&command_state).border_color(required(command_blank, cx))))
+                        .child(field("Action", Select::new(&kind_state).placeholder("Choose an action")))
+                        .when(is_command, |body| {
+                            body.child(field("Command", Input::new(&command_state).border_color(required(command_blank, cx))))
+                        })
                         .child(field("Background", ColorPicker::new(&background_state)))
                         .child(field(
                             "Image",
@@ -684,9 +940,16 @@ impl RustyDeckShell {
                 )
                 .on_ok(move |_event, _window, cx| {
                     let name = name_state.read(cx).value().to_string();
-                    let command = command_state.read(cx).value().to_string();
-                    if name.trim().is_empty() || command.trim().is_empty() {
-                        // Keep the dialog open until both are filled in, and mark which.
+                    // A built-in action needs no command, so it does not have to have one: the
+                    // field is not even shown, and requiring it would make the entry unsaveable.
+                    let builtin = match kind_state.read(cx).selected_value() {
+                        Some(ActionKind::Builtin(uuid)) => Some(uuid.to_string()),
+                        _ => None,
+                    };
+                    let command = if builtin.is_some() { String::new() } else { command_state.read(cx).value().to_string() };
+                    if name.trim().is_empty() || (builtin.is_none() && command.trim().is_empty()) {
+                        // Keep the dialog open until the required fields are filled in, and mark
+                        // which of them are blank.
                         ok_form.update(cx, |form, cx| {
                             form.invalid = true;
                             cx.notify();
@@ -701,7 +964,7 @@ impl RustyDeckShell {
 
                     let (mut spec, editing) = ok_form.read_with(cx, |form, _| (form.spec.clone(), form.editing.clone()));
                     spec.background = ok_form.read(cx).background.read(cx).value().map(hsla_to_hex);
-                    let _ = this.update(cx, |this, cx| this.save_custom_action(name, command, spec, editing, cx));
+                    let _ = this.update(cx, |this, cx| this.save_custom_action(name, command, builtin, spec, editing, cx));
                     true
                 })
         });
@@ -713,7 +976,7 @@ impl RustyDeckShell {
     /// both faces, which on a large photo is seconds of work. Doing that inline froze the window
     /// until it finished - and because nothing else could run in the meantime, the form appeared to
     /// accept only one action per launch.
-    fn save_custom_action(&mut self, name: String, command: String, spec: ImageSpec, editing: Option<String>, cx: &mut Context<Self>) {
+    fn save_custom_action(&mut self, name: String, command: String, builtin: Option<String>, spec: ImageSpec, editing: Option<String>, cx: &mut Context<Self>) {
         let form = self.form.clone();
         form.update(cx, |form, cx| {
             form.saving = true;
@@ -725,8 +988,8 @@ impl RustyDeckShell {
             let edited = editing.clone();
             let result = crate::bridge(async move {
                 tokio::task::spawn_blocking(move || match &editing {
-                    Some(id) => custom_actions::update(id, name, command, &spec),
-                    None => custom_actions::create(name, command, &spec),
+                    Some(id) => custom_actions::update(id, name, command, builtin, &spec),
+                    None => custom_actions::create(name, command, builtin, &spec),
                 })
                 .await
                 .unwrap_or_else(|error| Err(anyhow::anyhow!("compositing panicked: {error}")))
@@ -946,22 +1209,24 @@ impl RustyDeckShell {
                 cell = cell.child(img(resolve_image_path(&path)).size_full().object_fit(gpui::ObjectFit::Fill));
             }
 
-            // Clicking a filled slot runs it, exactly as pressing the physical key would -
-            // `trigger_virtual_press` drives the same key-down/up path the hardware does.
+            // Clicking a filled slot runs it, exactly as using the physical control would -
+            // both of these drive the same entry points the driver does.
             // A click and a drag do not conflict: GPUI only starts a drag past its 2px threshold.
             //
-            // A strip segment is the exception: its gesture is a tap, not a press, so on a
-            // simulated device it goes in through the touchscreen path instead.
+            // A strip segment's gesture is a tap, not a press, on every device rather than only a
+            // simulated one: the rectangle owns the tap command and the dial beneath it owns the
+            // press, so sending the click down the press path runs the dial's command instead.
             let press_context = context.clone();
-            let tap_instead_of_press = is_simulated(&device.id) && controller == ENCODER_CONTROLLER;
+            let taps = controller == ENCODER_CONTROLLER;
             cell = cell.on_click(move |_event, _window, cx| {
                 let context = press_context.clone();
-                if tap_instead_of_press {
-                    simulate_tap(&context.device, context.position);
-                    return;
-                }
                 cx.background_spawn(async move {
-                    if let Err(error) = crate::bridge(frontend::instances::trigger_virtual_press(context)).await {
+                    let result = if taps {
+                        crate::bridge(frontend::instances::trigger_virtual_tap(context)).await
+                    } else {
+                        crate::bridge(frontend::instances::trigger_virtual_press(context)).await
+                    };
+                    if let Err(error) = result {
                         log::error!("Failed to trigger action: {error}");
                     }
                 })
@@ -1077,7 +1342,7 @@ async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
     for (controller, count, (width, height)) in groups {
         let slots = slots(&profile, controller);
 
-        for position in 0..count.min(slots.len()) {
+        for (position, slot) in slots.iter().enumerate().take(count) {
             let context = SlotContext {
                 device: device.id.clone(),
                 profile: profile.id.clone(),
@@ -1085,7 +1350,7 @@ async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
                 position: position as u8,
             };
 
-            let image = match slots[position].as_ref() {
+            let image = match slot.as_ref() {
                 Some(instance) => match instance.states.get(instance.current_state as usize) {
                     Some(state) => {
                         // Compositing is CPU work, so it goes to a blocking worker rather than
@@ -1432,6 +1697,12 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
     .detach();
 }
 
+/// What a palette row does when a control on it is clicked.
+///
+/// `Rc` rather than a boxed closure because one row hands the same handler to several places, and
+/// the rows are rebuilt on every render.
+type RowAction = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// One row in the palette. A single type covers all three kinds so both sidebar sections share it -
 /// `Sidebar` is generic over one child type.
 ///
@@ -1439,21 +1710,21 @@ fn pick_file(form: Entity<ActionForm>, cx: &mut App) {
 #[derive(IntoElement)]
 enum PaletteRow {
     /// Opens the create-action dialog.
-    Create { collapsed: bool, on_click: Rc<dyn Fn(&mut Window, &mut App)> },
+    Create { collapsed: bool, on_click: RowAction },
     Custom {
         action: CustomAction,
         collapsed: bool,
         menu_open: bool,
-        on_menu: Rc<dyn Fn(&mut Window, &mut App)>,
-        on_execute: Rc<dyn Fn(&mut Window, &mut App)>,
-        on_edit: Rc<dyn Fn(&mut Window, &mut App)>,
-        on_delete: Rc<dyn Fn(&mut Window, &mut App)>,
+        on_menu: RowAction,
+        on_execute: RowAction,
+        on_edit: RowAction,
+        on_delete: RowAction,
     },
     Predefined { action: CustomAction, collapsed: bool },
 }
 
 /// One entry in a custom action's `...` menu.
-fn menu_entry(id: &'static str, label: &'static str, on_click: Rc<dyn Fn(&mut Window, &mut App)>, cx: &App) -> impl IntoElement {
+fn menu_entry(id: &'static str, label: &'static str, on_click: RowAction, cx: &App) -> impl IntoElement {
     div()
         .id(id)
         .w_full()
@@ -1616,6 +1887,21 @@ impl Render for DragPreview {
     }
 }
 
+/// What follows the cursor while a dial is being dragged: the knob itself, captioned as on screen.
+struct DialPreview {
+    label: SharedString,
+}
+
+impl Render for DialPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .items_center()
+            .gap_1()
+            .child(div().size(px(DIAL_SIZE)).rounded_full().bg(cx.theme().accent).border_1().border_color(cx.theme().primary))
+            .child(div().text_xs().text_color(cx.theme().foreground).child(self.label.clone()))
+    }
+}
+
 impl RustyDeckShell {
     /// Device identity, with a swap control for choosing another device.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1647,7 +1933,7 @@ impl RustyDeckShell {
                     .children({
                         // Real hardware first, then the simulated models under a heading, so a fake
                         // deck is never mistaken for something that is actually plugged in.
-                        let mut devices: Vec<DeviceInfo> = self.devices.iter().cloned().collect();
+                        let mut devices: Vec<DeviceInfo> = self.devices.to_vec();
                         devices.sort_by_key(|device| (is_simulated(&device.id), device.name.clone()));
                         let first_simulated = devices.iter().position(|device| is_simulated(&device.id));
 
@@ -1709,14 +1995,31 @@ impl RustyDeckShell {
             .bg(cx.theme().background)
             .child(div().text_xl().font_semibold().text_color(cx.theme().foreground).child(title))
             .child(
-                div().relative().child(
-                    Button::new("swap-device")
-                        .icon(IconName::Replace)
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.device_picker_open = !this.device_picker_open;
-                            cx.notify();
-                        })),
-                ),
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    // Restore reads a backup in; export writes one out. Arrows rather than the
+                    // tray icons, because the pair has to read as opposite directions at 16px.
+                    .child(
+                        Button::new("restore-backup")
+                            .icon(IconName::ArrowUp)
+                            .on_click(cx.listener(|this, _event, window, cx| this.choose_backup(window, cx))),
+                    )
+                    .child(
+                        Button::new("export-backup")
+                            .icon(IconName::ArrowDown)
+                            .on_click(cx.listener(|this, _event, window, cx| this.export_backup(window, cx))),
+                    )
+                    .child(
+                        div().relative().child(
+                            Button::new("swap-device")
+                                .icon(IconName::Replace)
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.device_picker_open = !this.device_picker_open;
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
             )
             .children(picker)
     }
@@ -1726,7 +2029,7 @@ impl RustyDeckShell {
     fn render_sidebar(&self, collapsed: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().downgrade();
         let create = entity.clone();
-        let open_dialog: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+        let open_dialog: RowAction = Rc::new(move |window, cx| {
             let _ = create.update(cx, |this, cx| this.open_action_dialog(None, window, cx));
         });
 
@@ -1901,15 +2204,28 @@ impl RustyDeckShell {
                     .hover(|style| style.bg(cx.theme().accent))
                     .on_click(cx.listener(move |this, _event, window, cx| this.open_dial_dialog(dial, window, cx)));
 
-                // Only a configured dial has anything to clear.
+                // Only a configured dial has anything to clear, or anything to carry elsewhere.
+                // A click and a drag do not conflict: GPUI only starts a drag past its 2px
+                // threshold, so a plain click still opens the dialog.
                 if configured {
-                    knob = knob.on_mouse_down(
-                        gpui::MouseButton::Right,
-                        cx.listener(move |this, _event, _window, cx| {
-                            this.dial_menu_open = Some(dial);
-                            cx.notify();
-                        }),
-                    );
+                    knob = knob
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.dial_menu_open = Some(dial);
+                                cx.notify();
+                            }),
+                        )
+                        .on_drag(
+                            DraggedDial {
+                                dial,
+                                label: label.clone(),
+                            },
+                            |dragged, _cursor_offset, _window, cx| {
+                                let label = dragged.label.clone();
+                                cx.new(|_| DialPreview { label })
+                            },
+                        );
                 }
 
                 v_flex()
@@ -1917,6 +2233,13 @@ impl RustyDeckShell {
                     .w(px(segment_width))
                     .items_center()
                     .gap_1()
+                    .rounded_md()
+                    // The drop lands anywhere in the dial's column rather than only on the knob:
+                    // a 44px circle is a mean target, and the column maps to one dial unambiguously.
+                    .drag_over::<DraggedDial>(|style, _dragged, _window, cx| style.bg(cx.theme().accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedDial, _window, cx| {
+                        this.swap_dials(dragged.dial, dial, cx);
+                    }))
                     .child(knob)
                     .child(
                         div()

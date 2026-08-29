@@ -704,7 +704,11 @@ fn save_config(slug: &str, config: &CustomActionConfig) -> Result<()> {
 }
 
 /// Create a custom action, giving it its own directory.
-pub fn create(name: String, command: String, spec: &ImageSpec) -> Result<CustomAction> {
+///
+/// `action` names a built-in action to place instead of Run Command, which is how an entry can
+/// carry the user's own artwork onto something the app already implements - a page step, say. When
+/// it is set, `command` is unused.
+pub fn create(name: String, command: String, action: Option<String>, spec: &ImageSpec) -> Result<CustomAction> {
 	let slug = unique_slug(&name, None);
 	let icon = compose(&directory(&slug), spec)?;
 
@@ -712,7 +716,7 @@ pub fn create(name: String, command: String, spec: &ImageSpec) -> Result<CustomA
 		id: new_id(),
 		name,
 		command,
-		action: None,
+		action,
 		category: None,
 		image: PICTURE.to_owned(),
 		icon,
@@ -731,7 +735,7 @@ pub fn create(name: String, command: String, spec: &ImageSpec) -> Result<CustomA
 ///
 /// The artwork is only recomposed when the user picked something new, so editing just the name or
 /// command leaves the existing image alone.
-pub fn update(slug: &str, name: String, command: String, spec: &ImageSpec) -> Result<CustomAction> {
+pub fn update(slug: &str, name: String, command: String, action: Option<String>, spec: &ImageSpec) -> Result<CustomAction> {
 	let mut config: CustomActionConfig = serde_json::from_slice(&std::fs::read(directory(slug).join("config.json"))?)?;
 
 	// Keep the directory named after the action.
@@ -742,6 +746,7 @@ pub fn update(slug: &str, name: String, command: String, spec: &ImageSpec) -> Re
 
 	config.name = name;
 	config.command = command;
+	config.action = action;
 
 	if !spec.is_empty() {
 		// Changing only the background must not discard the artwork: fall back to the source image

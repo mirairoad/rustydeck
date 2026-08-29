@@ -306,6 +306,28 @@ pub async fn update_image(context: Context, image: Option<String>) {
 	}
 }
 
+/// Tap a strip rectangle from the window, as touching the LCD above a dial does on the hardware.
+///
+/// A strip segment's gesture is a tap, not a press. The rectangle is the page-scoped half of that
+/// control and owns the tap command; the dial beneath it is device-scoped and owns the press. They
+/// are separate settings on separate stores, so sending a click down [`trigger_virtual_press`]
+/// would run the dial's command instead of the rectangle's - which is what used to happen.
+pub async fn trigger_virtual_tap(context: Context) -> Result<(), Error> {
+	crate::events::inbound::devices::touchscreen_press(crate::events::inbound::PayloadEvent {
+		payload: crate::events::inbound::devices::TouchscreenPressPayload {
+			device: context.device,
+			position: context.position,
+			// Centre of the segment; nothing downstream reads the coordinates.
+			x: 100,
+			y: 50,
+			hold: false,
+		},
+	})
+	.await?;
+
+	Ok(())
+}
+
 pub async fn trigger_virtual_press(context: Context) -> Result<(), Error> {
 	let event = || crate::events::inbound::PayloadEvent {
 		payload: crate::events::inbound::devices::PressPayload {

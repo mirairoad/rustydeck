@@ -123,23 +123,3 @@ pub fn press_dial(device: &str, position: u8) {
 		}
 	});
 }
-
-/// Tap the strip segment above a simulated dial.
-pub fn tap_strip(device: &str, position: u8) {
-	let device = device.to_owned();
-	crate::spawn(async move {
-		let event = PayloadEvent {
-			payload: devices::TouchscreenPressPayload {
-				device,
-				position,
-				// Centre of the segment; nothing downstream reads the coordinates.
-				x: 100,
-				y: 50,
-				hold: false,
-			},
-		};
-		if let Err(error) = devices::touchscreen_press(event).await {
-			log::error!("Simulated strip tap failed: {error}");
-		}
-	});
-}

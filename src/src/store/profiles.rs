@@ -16,6 +16,14 @@ pub struct ProfileStores {
 }
 
 impl ProfileStores {
+	/// Forget every cached profile, so the next read comes from disk.
+	///
+	/// For a restore: these hold the configuration that has just been replaced, and saving one
+	/// would write it back over the restored file.
+	pub fn clear(&mut self) {
+		self.stores.clear();
+	}
+
 	fn canonical_id(device: &str, id: &str) -> String {
 		if cfg!(target_os = "windows") {
 			PathBuf::from(device).join(id.replace('/', "\\")).to_str().unwrap().to_owned()
@@ -200,7 +208,17 @@ pub enum DialConfig {
 	/// A first-party action implemented in `system_actions`, named by its UUID.
 	System { uuid: String },
 	/// Shell commands run directly by the app: anticlockwise, clockwise, and a press.
-	Custom { left: String, right: String, centre: String },
+	///
+	/// `name` is what the knob is captioned with. It defaults in from configs written before dials
+	/// could be named, and is allowed to stay blank - the UI falls back to "Custom", which is what
+	/// every custom dial was called before.
+	Custom {
+		#[serde(default)]
+		name: String,
+		left: String,
+		right: String,
+		centre: String,
+	},
 }
 
 #[derive(Serialize, Deserialize)]
@@ -227,6 +245,11 @@ pub struct DeviceStores {
 }
 
 impl DeviceStores {
+	/// Forget every cached device configuration - see [`ProfileStores::clear`].
+	pub fn clear(&mut self) {
+		self.stores.clear();
+	}
+
 	pub fn get_selected_profile(&mut self, device: &str) -> Result<String, anyhow::Error> {
 		if !self.stores.contains_key(device) {
 			let default = DeviceConfig::default();
@@ -276,6 +299,26 @@ impl DeviceStores {
 		store.save()
 	}
 
+	/// Exchange what two dials do, so a layout can be rearranged without retyping it.
+	///
+	/// Moving a dial is always a swap: a dial is identified by its position on the device, so the
+	/// destination's config has to go somewhere and the source is the only place free to take it.
+	/// Dragging onto an unconfigured dial is therefore how a dial gets moved rather than exchanged.
+	pub fn swap_dials(&mut self, device: &str, encoders: usize, a: u8, b: u8) -> Result<(), anyhow::Error> {
+		if a == b {
+			return Ok(());
+		}
+
+		let store = self.dials_mut(device, encoders)?;
+		let count = store.value.dials.len();
+		if a as usize >= count || b as usize >= count {
+			return Err(anyhow!("dial {a} or {b} is out of range for device {device}"));
+		}
+
+		store.value.dials.swap(a as usize, b as usize);
+		store.save()
+	}
+
 	/// Copy the rotate and press commands off a page's encoder slots onto the device's dials, once.
 	///
 	/// Dials used to live in the profile alongside the rectangle above them, so an existing setup
@@ -307,7 +350,12 @@ impl DeviceStores {
 				if left.is_empty() && right.is_empty() && centre.is_empty() {
 					continue;
 				}
-				DialConfig::Custom { left, right, centre }
+				DialConfig::Custom {
+					name: String::new(),
+					left,
+					right,
+					centre,
+				}
 			};
 
 			store.value.dials[index] = Some(dial);
@@ -361,7 +409,7 @@ pub fn get_device_profiles(device: &str) -> Result<Vec<String>, anyhow::Error> {
 			let entries = fs::read_dir(entry.path())?;
 			for subentry in entries.flatten() {
 				if subentry.metadata()?.is_file() {
-					let mut id = format!("{}/{}", entry.file_name().to_string_lossy(), &subentry.file_name().to_string_lossy());
+					let mut id = format!("{}/{}", entry.file_name().to_string_lossy(), subentry.file_name().to_string_lossy());
 					if id.ends_with(".json") {
 						id.truncate(id.len() - 5);
 					} else if id.ends_with(".json.bak") {
@@ -389,6 +437,32 @@ pub static PROFILE_STORES: LazyLock<RwLock<ProfileStores>> = LazyLock::new(|| Rw
 
 /// A singleton object to manage Store instances for device configurations.
 pub static DEVICE_STORES: LazyLock<RwLock<DeviceStores>> = LazyLock::new(|| RwLock::new(DeviceStores { stores: HashMap::new() }));
+
+/// Read every connected device's profiles back into the cache.
+///
+/// A restore replaces the files these caches were built from, so they are dropped as part of the
+/// swap - but dropping them is not enough on its own. [`ProfileStores::get_profile_store`] is a
+/// read-only accessor that returns "profile not found" rather than creating what is missing, so
+/// every read path stays broken until something primes the cache. Registration is what normally
+/// does that, and after a restore there is no registration to wait for: the device never went
+/// away.
+///
+/// Device stores need no equivalent - [`DeviceStores::get_selected_profile`] and
+/// [`DeviceStores::dials_mut`] both create theirs on demand.
+pub async fn prime_stores() {
+	// Collected first, so no DashMap guard is held across an await.
+	let devices: Vec<DeviceInfo> = DEVICES.iter().map(|entry| entry.value().clone()).collect();
+
+	for device in devices {
+		let Ok(profiles) = get_device_profiles(&device.id) else { continue };
+		let mut profile_stores = PROFILE_STORES.write().await;
+		for profile in profiles {
+			if let Err(error) = profile_stores.get_profile_store_mut(&device, &profile).await {
+				log::error!("Failed to read profile {profile} of {} back: {error}", device.id);
+			}
+		}
+	}
+}
 
 pub struct Locks<'a> {
 	#[allow(dead_code)]

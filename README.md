@@ -1,7 +1,7 @@
 # RustyDeck
 
 A native Linux app for Elgato Stream Deck devices, written in Rust with
-[GPUI](https://www.gpui.rs/) - no webview, no plugin runtime, one binary.
+[GPUI](https://www.gpui.rs/). No webview, no plugin runtime, one 26 MiB binary.
 
 ## What it does
 
@@ -12,7 +12,7 @@ A native Linux app for Elgato Stream Deck devices, written in Rust with
 
 ## How a deck is modelled
 
-The physical controls fall into two halves, and they are configured separately:
+The physical controls fall into two halves, configured separately:
 
 | control | scope | gestures |
 | --- | --- | --- |
@@ -21,46 +21,109 @@ The physical controls fall into two halves, and they are configured separately:
 | **Key** | per page | press; owns the artwork |
 
 A dial is a fixed control, so it keeps doing the same thing whichever page is
-showing. The rectangle above it is the page-scoped half. They no longer share a
+showing. The rectangle above it is the page-scoped half. They do not share a
 slot, so neither can overwrite the other.
 
-Artwork is composed twice from the same source - a square face for keys and a
-2:1 face for the strip - because scaling one into the other stretches it.
+Dials are rearranged by dragging one knob onto another, which exchanges the two -
+dropping onto an unset dial is how one gets moved. A dial running your own
+commands can be given a name to caption the knob with; leave it blank and it
+stays "Custom".
+
+Artwork is composed twice from one source - a square face for keys and a 2:1
+face for the strip - because scaling one into the other stretches it. The create
+dialog previews both.
 
 ## Actions
 
-Everything is implemented in-process. Commands run through the user's login
-shell (`$SHELL -lic`) rather than `sh -c`, so aliases and shell functions
-resolve the way they do in a terminal - on Omarchy, for instance, `open` is a
-bash function that a non-interactive POSIX shell would never see.
+Everything runs in-process. Commands go through the user's login shell
+(`$SHELL -lic`) rather than `sh -c`, so aliases and shell functions resolve the
+way they do in a terminal - on Omarchy, for instance, `open` is a bash function
+that a non-interactive POSIX shell would never see.
 
-There is no plugin system and no marketplace. Actions are first-party, and
-adding one means writing it here.
+There is no plugin system and no marketplace. Actions are first-party; adding
+one means writing it here.
 
 ## Building
 
 ```sh
 cd src
-cargo build --release      # ~26 MiB binary
-cargo run                  # debug build, with the simulator
+cargo build --release        # target/release/rustydeck, ~26 MiB
 ```
 
 Linux only. The release profile is tuned for size: `opt-level = "s"`, fat LTO,
-one codegen unit, symbols stripped.
+one codegen unit, symbols stripped. That last stretch pegs a single core - it is
+worth about 5 MB of binary against 5 seconds of build time, so it stays.
+
+Debug builds compile dependencies optimised (`[profile.dev.package."*"]`). The
+image codecs are the hot path when composing artwork and are roughly eighty
+times slower unoptimised, which is enough to make a large photo feel broken in
+development. Your own crate stays unoptimised and debuggable.
+
+## Installing
+
+```sh
+sudo install -Dm755 src/target/release/rustydeck /usr/local/bin/rustydeck
+sudo install -Dm644 src/bundle/40-streamdeck.rules /usr/lib/udev/rules.d/40-streamdeck.rules
+sudo install -Dm644 src/bundle/rustydeck.desktop  /usr/share/applications/rustydeck.desktop
+sudo install -Dm644 src/icons/icon.png            /usr/share/icons/hicolor/512x512/apps/rustydeck.png
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+The udev rules are what let the app open the device without root. Replug the
+deck after installing them.
+
+Configuration lives in `~/.rustydeck`: `profiles/` (one file per device plus a
+directory of pages), `customs/` and `predefined/` (action libraries, each action
+a directory with its config and artwork), and `settings.json`.
+
+## Backup and restore
+
+The two arrows in the header back the configuration up and put it back.
+
+**Export** writes a zip named `rustydeck_DDMMYY_XXXXXXXX.zip` holding the action
+library and its artwork, every device's dials, pages and selected profile, and
+`settings.json`. Logs are left out, being neither small nor configuration.
+
+**Restore** replaces all of that with what the archive holds - it is a restore,
+not a merge, and it asks before doing anything. The configuration it replaces is
+moved to `~/.rustydeck.replaced-<timestamp>` rather than deleted, and the dialog
+says where, so restoring the wrong file is one `mv` away from being undone.
+
+The swap goes through a staging directory beside the configuration root:
+extraction is not atomic and can fail halfway, so doing it to one side means a
+failure leaves the existing setup untouched. An archive that is not a RustyDeck
+backup, or that contains a path climbing out of the directory, is refused before
+anything moves.
 
 ## The simulator
 
 Debug builds register a simulated deck for every model - Mini, Stream Deck,
 MK.2, XL, +, XL+, Neo and Pedal - so layouts can be built and actions driven
-without the hardware plugged in. They appear in the device picker under a
-`Simulated` heading, tinted purple.
+with nothing plugged in. They appear in the device picker under a `Simulated`
+heading, tinted purple, and each knob gets `◀ ● ▶` controls.
 
 Simulated input enters at the same points the driver uses, so the debounce, the
 dial config and the command that runs are the code paths real hardware takes.
-Their ids are prefixed `sim-` rather than `sd-`, which is what keeps every
-hardware write from reaching a device that is not there.
+Ids are prefixed `sim-` rather than `sd-`, which is what stops any hardware
+write reaching a device that is not there.
 
 None of it is compiled into a release build.
+
+## Development
+
+`shared::Timed` logs how long a step took and compiles its logging out of
+release builds:
+
+```rust
+let _timed = Timed::start("compose");
+```
+
+Timings appear as `[timing] …` lines. Worth reaching for before optimising
+anything: the artwork pipeline turned out to be slow for reasons nobody guessed
+correctly, and the numbers settled it in one run.
+
+`.claude/skills/gpui-patterns/` collects the GPUI rules this UI was built on -
+z-ordering, threading, dialog state, and the traps that cost time here.
 
 ## Where this came from
 
@@ -71,9 +134,9 @@ still uses its device I/O over
 profile and settings storage.
 
 Two things have since diverged. OpenDeck's Svelte/Tauri webview UI is replaced
-by a native GPUI shell, and the Stream Deck / OpenAction plugin protocol is
-gone - the WebSocket transport, the property-inspector webserver, plugin
-installation and the bundled `com.amansprojects.starterpack` plugin process were
-all removed, and the one action anyone used became internal.
+by a native GPUI shell, and the Stream Deck / OpenAction plugin protocol is gone
+- the WebSocket transport, the property-inspector webserver, plugin installation
+and the bundled `com.amansprojects.starterpack` plugin process were all removed,
+and the one action anyone used became internal.
 
 Licensed GPL-3.0-or-later, as OpenDeck is. See [LICENSE.md](LICENSE.md).

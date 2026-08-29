@@ -171,3 +171,12 @@ pub fn get_settings() -> Store<Settings> {
 
 pub static SETTINGS_MUT: std::sync::LazyLock<tokio::sync::Mutex<Store<Settings>>> =
 	std::sync::LazyLock::new(|| tokio::sync::Mutex::new(Store::new_concurrent("settings", &crate::shared::config_dir(), Settings::default())));
+
+/// Re-read the cached settings from disk, discarding what is held in memory.
+///
+/// Only a restore needs this. [`SETTINGS_MUT`] keeps its value between saves, so after the file
+/// underneath it has been replaced the next save would write the superseded settings back over the
+/// restored ones.
+pub async fn reload_settings() {
+	*SETTINGS_MUT.lock().await = Store::new_concurrent("settings", &crate::shared::config_dir(), Settings::default());
+}
