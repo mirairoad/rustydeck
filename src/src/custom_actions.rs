@@ -9,6 +9,7 @@
 //! without asking the user to find the source file again, and an action stays intact if they move
 //! or delete the original.
 
+use crate::animation::{Animation, Transform};
 use crate::device_render::{CANVAS, blend, parse_colour};
 use crate::shared::config_dir;
 use crate::store::{NotProfile, Store};
@@ -43,6 +44,9 @@ pub struct CustomActionConfig {
 	pub icon: Option<String>,
 	/// Background colour as `#RRGGBB`, or `None` for no fill.
 	pub background: Option<String>,
+	/// The effect this action plays, if any. Absent in configs written before animation existed.
+	#[serde(default)]
+	pub animation: Option<Animation>,
 }
 
 impl NotProfile for CustomActionConfig {}
@@ -81,6 +85,11 @@ impl CustomAction {
 
 	fn dir(&self) -> PathBuf {
 		self.root.join(&self.slug)
+	}
+
+	/// The action's own directory, for a caller that needs to reach its frames.
+	pub fn directory(&self) -> PathBuf {
+		self.dir()
 	}
 
 	/// Absolute path to the composited key face.
@@ -155,6 +164,9 @@ pub const PICTURE: &str = "picture.png";
 
 /// The same artwork composed for the touch strip's rectangle rather than a square key.
 pub const STRIP: &str = "strip.png";
+
+/// Where an animated action's frames live, under its own directory.
+pub const FRAMES: &str = "frames";
 
 /// Composed at twice the key canvas's width so it downsamples cleanly to the 200x100 region the
 /// hardware actually writes.
@@ -323,6 +335,7 @@ fn ensure_predefined() {
 			image: PICTURE.to_owned(),
 			icon: None,
 			background: Some(colour.to_owned()),
+			animation: None,
 		};
 		if let Err(error) = write_config(&directory, &config) {
 			log::error!("Failed to write {name} config: {error}");
@@ -351,6 +364,7 @@ fn ensure_predefined() {
 			image: PICTURE.to_owned(),
 			icon: None,
 			background: Some(colour.to_owned()),
+			animation: None,
 		};
 		if let Err(error) = write_config(&directory, &config) {
 			log::error!("Failed to write Device Brightness config: {error}");
@@ -393,7 +407,7 @@ fn ensure_strip(directory: &Path, config: &CustomActionConfig) {
 			return;
 		}
 	};
-	if let Err(error) = compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, loaded.as_ref(), is_icon, config.background.as_deref())
+	if let Err(error) = compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, loaded.as_ref(), is_icon, config.background.as_deref(), Transform::IDENTITY)
 		.and_then(|canvas| write_picture(canvas, &directory.join(STRIP)))
 	{
 		log::warn!("Failed to compose strip artwork in {}: {error}", directory.display());
@@ -619,7 +633,7 @@ pub fn has_transparency(path: &Path) -> bool {
 /// Taking the shape as a parameter is what lets the touch strip have its own render. The strip is a
 /// 2:1 rectangle, so displaying the square key face there would stretch a photo; cropping a fresh
 /// 2:1 canvas from the original keeps its proportions.
-fn compose_canvas(width: u32, height: u32, source: Option<&Source>, is_icon: bool, background: Option<&str>) -> Result<RgbaImage> {
+fn compose_canvas(width: u32, height: u32, source: Option<&Source>, is_icon: bool, background: Option<&str>, transform: Transform) -> Result<RgbaImage> {
 	let mut canvas = RgbaImage::new(width, height);
 	if let Some(background) = background {
 		let colour = parse_colour(background);
@@ -634,14 +648,25 @@ fn compose_canvas(width: u32, height: u32, source: Option<&Source>, is_icon: boo
 		let margin_x = (width as f32 * inset).round() as u32;
 		let margin_y = (height as f32 * inset).round() as u32;
 
-		let decoded = source.fit(width - margin_x * 2, height - margin_y * 2, fit)?;
+		// The transform scales the box the artwork is fitted into and shifts where it lands, which
+		// keeps every frame going through exactly the same fit and blend the still does. Scaling
+		// the finished still instead would resample already-resampled pixels once per frame.
+		let box_width = ((width - margin_x * 2) as f32 * transform.scale).round().max(1.0) as u32;
+		let box_height = ((height - margin_y * 2) as f32 * transform.scale).round().max(1.0) as u32;
+
+		// Centred on where the resting artwork sits, so a scaled frame grows and shrinks about its
+		// own middle rather than its top-left corner.
+		let origin_x = margin_x as i32 + (width - margin_x * 2) as i32 / 2 - box_width as i32 / 2 + (transform.offset.0 * width as f32).round() as i32;
+		let origin_y = margin_y as i32 + (height - margin_y * 2) as i32 / 2 - box_height as i32 / 2 + (transform.offset.1 * height as f32).round() as i32;
+
+		let decoded = source.fit(box_width, box_height, fit)?;
 		for (x, y, pixel) in decoded.enumerate_pixels() {
 			blend(
 				&mut canvas,
-				margin_x as i32 + x as i32,
-				margin_y as i32 + y as i32,
+				origin_x + x as i32,
+				origin_y + y as i32,
 				*pixel,
-				pixel[3] as f32 / 255.0,
+				pixel[3] as f32 / 255.0 * transform.alpha,
 			);
 		}
 	}
@@ -656,7 +681,7 @@ fn compose_canvas(width: u32, height: u32, source: Option<&Source>, is_icon: boo
 /// scaling the square one is the whole point - the rectangle would otherwise stretch the artwork.
 ///
 /// Returns the copied source's filename, if there was one.
-fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
+fn compose(directory: &Path, spec: &ImageSpec, animation: Option<&Animation>) -> Result<Option<String>> {
 	let _timed = crate::shared::Timed::start("compose (both faces)");
 	std::fs::create_dir_all(directory)?;
 
@@ -684,13 +709,70 @@ fn compose(directory: &Path, spec: &ImageSpec) -> Result<Option<String>> {
 	let is_icon = stored_source.as_deref().map(has_transparency).unwrap_or(false);
 	let source = stored_source.as_deref().map(Source::load).transpose()?;
 
-	write_picture(compose_canvas(CANVAS, CANVAS, source.as_ref(), is_icon, background)?, &directory.join(PICTURE))?;
 	write_picture(
-		compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source.as_ref(), is_icon, background)?,
+		compose_canvas(CANVAS, CANVAS, source.as_ref(), is_icon, background, Transform::IDENTITY)?,
+		&directory.join(PICTURE),
+	)?;
+	write_picture(
+		compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source.as_ref(), is_icon, background, Transform::IDENTITY)?,
 		&directory.join(STRIP),
 	)?;
 
+	compose_frames(directory, source.as_ref(), is_icon, background, animation)?;
+
 	Ok(source_name)
+}
+
+/// A comparable stand-in for an animation, so a change to one can be noticed.
+///
+/// `Animation` is not `PartialEq` because `Effect` and `Speed` are the only things in it that vary,
+/// and comparing those two directly says everything without the derive spreading further.
+fn animation_key(animation: Option<&Animation>) -> Option<(crate::animation::Effect, crate::animation::Speed)> {
+	animation.map(|animation| (animation.effect, animation.speed))
+}
+
+/// The file one frame of one face is stored as.
+fn frame_path(directory: &Path, face: &str, index: usize) -> PathBuf {
+	directory.join(FRAMES).join(format!("{face}-{index:04}.png"))
+}
+
+/// Absolute path to a stored frame, for a caller outside this module.
+pub fn frame_file(action_dir: &Path, strip: bool, index: usize) -> PathBuf {
+	frame_path(action_dir, if strip { "strip" } else { "key" }, index)
+}
+
+/// Write every frame of the action's animation, or clear them if it has none.
+///
+/// Each frame goes through the same `compose_canvas` the still does, so the background, the inset
+/// and the fit are identical and a frame cannot drift from the still it belongs to. Frame zero is
+/// the identity transform, which makes it the still itself - that is what lets everything which
+/// cannot animate simply show frame zero.
+fn compose_frames(directory: &Path, source: Option<&Source>, is_icon: bool, background: Option<&str>, animation: Option<&Animation>) -> Result<()> {
+	let frames = directory.join(FRAMES);
+
+	// An action that has stopped animating must not leave its old frames behind: the player reads
+	// the directory, so a stale frame would keep playing after the effect was turned off.
+	if frames.exists() {
+		std::fs::remove_dir_all(&frames)?;
+	}
+
+	let Some(animation) = animation else { return Ok(()) };
+	let _timed = crate::shared::Timed::start("compose (animation frames)");
+	std::fs::create_dir_all(&frames)?;
+
+	for index in 0..animation.frame_count() {
+		let transform = animation.effect.transform(index);
+		write_picture(
+			compose_canvas(CANVAS, CANVAS, source, is_icon, background, transform)?,
+			&frame_path(directory, "key", index),
+		)?;
+		write_picture(
+			compose_canvas(STRIP_SIZE.0, STRIP_SIZE.1, source, is_icon, background, transform)?,
+			&frame_path(directory, "strip", index),
+		)?;
+	}
+
+	Ok(())
 }
 
 fn write_config(directory: &Path, config: &CustomActionConfig) -> Result<()> {
@@ -708,9 +790,9 @@ fn save_config(slug: &str, config: &CustomActionConfig) -> Result<()> {
 /// `action` names a built-in action to place instead of Run Command, which is how an entry can
 /// carry the user's own artwork onto something the app already implements - a page step, say. When
 /// it is set, `command` is unused.
-pub fn create(name: String, command: String, action: Option<String>, spec: &ImageSpec) -> Result<CustomAction> {
+pub fn create(name: String, command: String, action: Option<String>, animation: Option<Animation>, spec: &ImageSpec) -> Result<CustomAction> {
 	let slug = unique_slug(&name, None);
-	let icon = compose(&directory(&slug), spec)?;
+	let icon = compose(&directory(&slug), spec, animation.as_ref())?;
 
 	let config = CustomActionConfig {
 		id: new_id(),
@@ -721,6 +803,7 @@ pub fn create(name: String, command: String, action: Option<String>, spec: &Imag
 		image: PICTURE.to_owned(),
 		icon,
 		background: spec.background.clone(),
+		animation,
 	};
 
 	save_config(&slug, &config)?;
@@ -735,7 +818,7 @@ pub fn create(name: String, command: String, action: Option<String>, spec: &Imag
 ///
 /// The artwork is only recomposed when the user picked something new, so editing just the name or
 /// command leaves the existing image alone.
-pub fn update(slug: &str, name: String, command: String, action: Option<String>, spec: &ImageSpec) -> Result<CustomAction> {
+pub fn update(slug: &str, name: String, command: String, action: Option<String>, animation: Option<Animation>, spec: &ImageSpec) -> Result<CustomAction> {
 	let mut config: CustomActionConfig = serde_json::from_slice(&std::fs::read(directory(slug).join("config.json"))?)?;
 
 	// Keep the directory named after the action.
@@ -748,7 +831,13 @@ pub fn update(slug: &str, name: String, command: String, action: Option<String>,
 	config.command = command;
 	config.action = action;
 
-	if !spec.is_empty() {
+	// The animation is as much a part of the artwork as the image is, so changing it alone has to
+	// recompose - otherwise turning an effect on for an action whose picture is unchanged would
+	// save the setting and write no frames for it.
+	let animation_changed = animation_key(animation.as_ref()) != animation_key(config.animation.as_ref());
+	config.animation = animation;
+
+	if !spec.is_empty() || animation_changed {
 		// Changing only the background must not discard the artwork: fall back to the source image
 		// copied into the action's directory when the user did not pick a new one. This is exactly
 		// why the source is kept alongside the composited result.
@@ -768,7 +857,7 @@ pub fn update(slug: &str, name: String, command: String, action: Option<String>,
 			spec.background = config.background.clone();
 		}
 
-		config.icon = compose(&directory(&new_slug), &spec)?;
+		config.icon = compose(&directory(&new_slug), &spec, config.animation.as_ref())?;
 		config.image = PICTURE.to_owned();
 		config.background = spec.background.clone();
 	}
