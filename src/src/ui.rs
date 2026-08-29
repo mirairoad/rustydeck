@@ -1616,13 +1616,23 @@ fn preview_tile(
                 .border_1()
                 .border_color(cx.theme().border)
                 .overflow_hidden()
+                // The inset is a margin on all four sides, as in `compose_canvas`, so the image box
+                // is centred here rather than expressed as padding on a wrapper.
+                .flex()
+                .items_center()
+                .justify_center()
                 .when_some(background, |tile, colour| tile.bg(colour))
                 .children(image.map(|path| {
-                    div()
-                        .size_full()
-                        .px(px(inset_x))
-                        .py(px(inset_y))
-                        .child(img(resolve_image_path(path)).size_full().object_fit(fit))
+                    // Both dimensions given explicitly, and deliberately: `Img` sets `aspect_ratio`
+                    // from the image itself, which with a `size_full` box wins over the tile's own
+                    // shape. A square image in the 2:1 strip tile then laid itself out as wide as
+                    // the tile and twice as tall, from the top - so the preview showed the top of
+                    // the artwork rather than the middle. A wide photo was close enough to 2:1 to
+                    // look right, which is why only small square images showed it.
+                    img(resolve_image_path(path))
+                        .w(px(width - inset_x * 2.0))
+                        .h(px(height - inset_y * 2.0))
+                        .object_fit(fit)
                 })),
         )
         .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label))
