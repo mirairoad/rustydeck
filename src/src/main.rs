@@ -21,15 +21,16 @@ use shared::PRODUCT_NAME;
 
 use std::future::Future;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{App, Application, Bounds, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions, prelude::*, px, size};
 use gpui_component::Root;
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-/// gpui-component requires the window's root view to be its `Root`, which hosts dialogs,
-/// notifications and popovers - so the handle is to that rather than to our own shell view.
-static MAIN_WINDOW: OnceLock<WindowHandle<Root>> = OnceLock::new();
+
+/// What the compositor and the desktop entry's `StartupWMClass` identify the window by.
+const APP_ID: &str = "rustydeck";
 
 const SAVE_PROBE: Duration = Duration::from_secs(30);
 
@@ -79,8 +80,8 @@ fn tray_icon_image() -> tray_icon::Icon {
 
 /// The tray icon and its menu need a running GTK event loop on Linux, independent of GPUI's own
 /// platform loop - see `tray-icon`'s crate docs. This thread owns that loop for the process
-/// lifetime; the tray/menu objects only ever live here. Tray/menu *events* still reach GPUI via
-/// the crate's global channels, polled from `poll_tray_events` on the GPUI foreground executor.
+/// lifetime; the tray/menu objects only ever live here, and so does everything that reads or
+/// writes them - both draining their event channels and keeping their enabled state current.
 fn spawn_tray_thread() {
 	std::thread::spawn(|| {
 		if let Err(error) = gtk::init() {
@@ -105,6 +106,19 @@ fn spawn_tray_thread() {
 		let _ = menu.append(&restart);
 		let _ = menu.append(&quit);
 
+		// Keep the two window items honest about what they can do. With the window already open
+		// "Show" has nothing left to do - a Wayland compositor is free to refuse a raise request and
+		// Hyprland does - and with it hidden "Hide" has nothing to do either. Greying the one that
+		// does not apply is also the only way the tray can say which state the app is in.
+		let (show_item, hide_item) = (show.clone(), hide.clone());
+		gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+			let showing = WINDOW_WANTED.load(Ordering::Relaxed);
+			show_item.set_enabled(!showing);
+			hide_item.set_enabled(showing);
+			poll_tray_events();
+			gtk::glib::ControlFlow::Continue
+		});
+
 		let _tray = match tray_icon::TrayIconBuilder::new()
 			.with_id("rustydeck")
 			.with_menu(Box::new(menu))
@@ -124,61 +138,180 @@ fn spawn_tray_thread() {
 	});
 }
 
-/// Poll the tray icon's and menu's global event channels on GPUI's own foreground executor.
+/// What the process should be doing, decided by the tray, the window's close button and the
+/// compositor, and acted on by the window loop in `main`.
+///
+/// These are plain flags rather than a channel because whoever sets them may be running when there
+/// is no GPUI application at all - the tray thread outlives every window - and because the window
+/// loop needs to be able to ask "is a window wanted right now?" rather than replay a queue.
+static WINDOW_WANTED: AtomicBool = AtomicBool::new(true);
+static RAISE_WANTED: AtomicBool = AtomicBool::new(false);
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// The thread running the window loop, so a request can wake it out of `park` immediately.
+static WINDOW_LOOP: OnceLock<std::thread::Thread> = OnceLock::new();
+
+fn wake_window_loop() {
+	if let Some(thread) = WINDOW_LOOP.get() {
+		thread.unpark();
+	}
+}
+
+/// Ask for the window: opened if there is none, brought forward if there is.
+fn request_show() {
+	RAISE_WANTED.store(true, Ordering::Relaxed);
+	WINDOW_WANTED.store(true, Ordering::Relaxed);
+	wake_window_loop();
+}
+
+/// Ask for the window to go away, leaving the process running for the deck and the tray.
+fn request_hide() {
+	WINDOW_WANTED.store(false, Ordering::Relaxed);
+	wake_window_loop();
+}
+
+pub fn request_quit() {
+	QUITTING.store(true, Ordering::Relaxed);
+	WINDOW_WANTED.store(false, Ordering::Relaxed);
+	wake_window_loop();
+}
+
+/// What the window's own close control and the compositor's close request both mean: put the
+/// window away, and stop the app only if background running has been turned off.
+pub fn dismiss_window() {
+	if store::get_settings().value.background { request_hide() } else { request_quit() }
+}
+
+fn toggle_window() {
+	if WINDOW_WANTED.load(Ordering::Relaxed) { request_hide() } else { request_show() }
+}
+
+/// Drain the tray icon's and menu's global event channels.
+///
 /// `tray-icon`/`muda` deliver events through process-global channels meant to be polled with
-/// `try_recv` from the embedding app's own event loop, so this fits GPUI's cooperative
-/// single-threaded model without needing to bridge threads for every click.
-fn poll_tray_events(cx: &mut App) {
+/// `try_recv` by the embedding app. This used to be polled on GPUI's executor, which only exists
+/// while a window does - so the tray stopped responding exactly when it became the only way back
+/// in. GTK's loop, which owns the tray for the lifetime of the process, is the one that never goes
+/// away.
+fn poll_tray_events() {
+	while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+		if let tray_icon::TrayIconEvent::Click {
+			button: tray_icon::MouseButton::Left,
+			button_state: tray_icon::MouseButtonState::Down,
+			..
+		} = event
+		{
+			toggle_window();
+		}
+	}
+
+	while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+		match event.id() {
+			id if id == "show" => request_show(),
+			id if id == "hide" => request_hide(),
+			id if id == "restart" => restart_app(),
+			id if id == "quit" => request_quit(),
+			_ => {}
+		}
+	}
+}
+
+/// Act on show/hide requests from inside the running application, where a `Window` can be reached.
+fn watch_window_requests(window: WindowHandle<Root>, cx: &mut App) {
 	cx.spawn(async move |cx| {
 		loop {
 			cx.background_executor().timer(Duration::from_millis(100)).await;
 
-			while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
-				if let tray_icon::TrayIconEvent::Click {
-					button: tray_icon::MouseButton::Left,
-					button_state: tray_icon::MouseButtonState::Down,
-					..
-				} = event
-				{
-					let _ = cx.update(toggle_main_window);
-				}
+			if !WINDOW_WANTED.load(Ordering::Relaxed) {
+				let _ = cx.update(|cx| window.update(cx, |_, window, _| window.remove_window()));
+				return;
 			}
 
-			while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-				match event.id() {
-					id if id == "show" => {
-						let _ = cx.update(show_main_window);
-					}
-					id if id == "hide" => {
-						let _ = cx.update(hide_main_window);
-					}
-					id if id == "restart" => restart_app(),
-					id if id == "quit" => {
-						let _ = cx.update(|cx| cx.quit());
-					}
-					_ => {}
-				}
+			if RAISE_WANTED.swap(false, Ordering::Relaxed) {
+				let _ = cx.update(|cx| window.update(cx, |_, window, _| window.activate_window()));
 			}
 		}
 	})
 	.detach();
 }
 
-fn show_main_window(cx: &mut App) {
-	let _ = MAIN_WINDOW.get().unwrap().update(cx, |_, window, _| window.activate_window());
+/// Open the window and run GPUI until that window closes, then return.
+///
+/// Closing the last window ends GPUI's event loop on Linux, so one call to this is one visible
+/// session of the app rather than the lifetime of the process. Everything that has to keep running
+/// while the window is away - the devices, the animations, the tray - is started by `main` before
+/// this is ever called, and none of it is touched by the application being torn down and rebuilt.
+fn run_window_session() {
+	// `gpui_component_assets::Assets` serves the icon SVGs its components reference; the crate
+	// deliberately ships none itself, expecting the host app to register an asset source.
+	Application::new().with_assets(gpui_component_assets::Assets).run(|cx: &mut App| {
+		gpui_component::init(cx);
+		// The component library defaults to light; the deck view is dark artwork on dark keys, so
+		// the chrome matches it rather than framing it in white.
+		gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+
+		let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+		let window = cx
+			.open_window(
+				WindowOptions {
+					window_bounds: Some(WindowBounds::Windowed(bounds)),
+					titlebar: Some(TitlebarOptions {
+						title: Some(PRODUCT_NAME.into()),
+						..Default::default()
+					}),
+					// What the compositor identifies the window by: window rules, taskbar grouping
+					// and the `StartupWMClass` in our desktop entry all match on this, and without
+					// it the window arrives anonymous and none of them can name it.
+					app_id: Some(APP_ID.into()),
+					..Default::default()
+				},
+				|window, cx| {
+					// `TitlebarOptions::title` is only read by the macOS backend; on Wayland and X11
+					// the title has to be set on the window itself or it stays empty.
+					window.set_window_title(PRODUCT_NAME);
+					window.on_window_should_close(cx, |_, _| {
+						// Always let the window close. Refusing and minimising instead used to leave
+						// it on screen for good on Wayland: `xdg_toplevel.set_minimized` is a request
+						// a compositor may ignore, and Hyprland, having no concept of minimised, does.
+						// Closing is the one dismissal every desktop implements, so the window is
+						// closed for real and the process stays alive behind the tray.
+						dismiss_window();
+						true
+					});
+					let shell = cx.new(|cx| ui::RustyDeckShell::new(window, cx));
+					cx.new(|cx| Root::new(shell, window, cx))
+				},
+			)
+			.expect("failed to open the main window");
+
+		cx.activate(true);
+		watch_window_requests(window, cx);
+	});
 }
 
-fn hide_main_window(cx: &mut App) {
-	let _ = MAIN_WINDOW.get().unwrap().update(cx, |_, window, _| window.minimize_window());
-}
-
-fn toggle_main_window(cx: &mut App) {
-	let active = MAIN_WINDOW.get().unwrap().update(cx, |_, window, _| window.is_window_active()).unwrap_or(false);
-	if active {
-		hide_main_window(cx);
-	} else {
-		show_main_window(cx);
-	}
+/// Start everything that serves the deck, independently of whether a window is open.
+fn start_backend() {
+	spawn(async {
+		loop {
+			elgato::initialise_devices().await;
+			tokio::time::sleep(Duration::from_secs(10)).await;
+		}
+	});
+	// Simulated devices exist only in debug builds, so a release binary offers real hardware
+	// and nothing else.
+	#[cfg(debug_assertions)]
+	spawn(simulator::register_all());
+	spawn(async {
+		loop {
+			tokio::time::sleep(SAVE_PROBE).await;
+			if let Err(error) = store::profiles::flush_stale_profiles().await {
+				log::error!("Failed to flush stale profiles: {error}");
+			}
+		}
+	});
+	application_watcher::init_application_watcher();
+	device_sleep::init_device_sleep();
+	power_events::init_power_events();
 }
 
 fn main() {
@@ -203,77 +336,23 @@ fn main() {
 	}
 	let _ = simplelog::CombinedLogger::init(loggers);
 
-	// `gpui_component_assets::Assets` serves the icon SVGs its components reference; the crate
-	// deliberately ships none itself, expecting the host app to register an asset source.
-	Application::new().with_assets(gpui_component_assets::Assets).run(|cx: &mut App| {
-		gpui_component::init(cx);
-		// The component library defaults to light; the deck view is dark artwork on dark keys, so
-		// the chrome matches it rather than framing it in white.
-		gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+	start_backend();
+	spawn_tray_thread();
 
-		let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
-		let window = cx
-			.open_window(
-				WindowOptions {
-					window_bounds: Some(WindowBounds::Windowed(bounds)),
-					titlebar: Some(TitlebarOptions {
-						title: Some(PRODUCT_NAME.into()),
-						..Default::default()
-					}),
-					..Default::default()
-				},
-				|window, cx| {
-					window.on_window_should_close(cx, |window, cx| {
-						if store::get_settings().value.background {
-							window.minimize_window();
-							false
-						} else {
-							cx.quit();
-							true
-						}
-					});
-					let shell = cx.new(|cx| ui::RustyDeckShell::new(window, cx));
-					cx.new(|cx| Root::new(shell, window, cx))
-				},
-			)
-			.expect("failed to open the main window");
-		MAIN_WINDOW.set(window).ok();
+	WINDOW_LOOP.set(std::thread::current()).ok();
+	while !QUITTING.load(Ordering::Relaxed) {
+		if WINDOW_WANTED.load(Ordering::Relaxed) {
+			run_window_session();
+		} else {
+			// Hidden: the deck is being served by the background tasks and the tray is the way back
+			// in. Parking rather than spinning costs nothing; the timeout is only a backstop in case
+			// a request lands between the check above and the park.
+			std::thread::park_timeout(Duration::from_secs(1));
+		}
+	}
 
-		cx.activate(true);
-
-		// Backend subsystems - unchanged in substance from the old Tauri `.setup()` closure, just
-		// invoked directly instead of from inside Tauri's builder.
-		spawn(async {
-			loop {
-				elgato::initialise_devices().await;
-				tokio::time::sleep(Duration::from_secs(10)).await;
-			}
-		});
-		// Simulated devices exist only in debug builds, so a release binary offers real hardware
-		// and nothing else.
-		#[cfg(debug_assertions)]
-		spawn(simulator::register_all());
-		spawn(async {
-			loop {
-				tokio::time::sleep(SAVE_PROBE).await;
-				if let Err(error) = store::profiles::flush_stale_profiles().await {
-					log::error!("Failed to flush stale profiles: {error}");
-				}
-			}
-		});
-		application_watcher::init_application_watcher();
-		device_sleep::init_device_sleep();
-		power_events::init_power_events();
-
-		spawn_tray_thread();
-		poll_tray_events(cx);
-
-		cx.on_app_quit(|_cx| async {
-			if let Err(error) = store::profiles::flush_stale_profiles().await {
-				log::error!("Failed to flush stale profiles on exit: {error}");
-			}
-			elgato::reset_devices().await;
-		})
-		.detach();
-	});
+	if let Err(error) = RUNTIME.get().unwrap().block_on(store::profiles::flush_stale_profiles()) {
+		log::error!("Failed to flush stale profiles on exit: {error}");
+	}
+	RUNTIME.get().unwrap().block_on(elgato::reset_devices());
 }
