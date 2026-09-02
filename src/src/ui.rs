@@ -4,7 +4,7 @@
 
 use crate::animation::{Animation, Effect, Speed, Trigger};
 use crate::custom_actions::{self, CustomAction, ImageSpec};
-use crate::device_render::{render_state, resolve_image_path};
+use crate::device_render::{INFOBAR_IMAGE, resolve_image_path};
 use crate::events::frontend;
 use crate::frontend_events::{self, FrontendEvent};
 use crate::shared::{Action, ActionInstance, Category, Context as SlotContext, DeviceInfo, Profile};
@@ -95,13 +95,6 @@ fn is_simulated(device_id: &str) -> bool {
 const KEYPAD_CONTROLLER: &str = "Keypad";
 const ENCODER_CONTROLLER: &str = "Encoder";
 const INFOBAR_CONTROLLER: &str = "Infobar";
-
-/// Sizes of the physical displays each controller writes to. Keys are square, but the touch strip
-/// is one wide LCD written a 200x100 region at a time (one per dial), and the Neo's infobar is a
-/// letterbox - so each kind has to be composited at its own aspect, not scaled from a square.
-const KEY_IMAGE: (u32, u32) = (144, 144);
-const ENCODER_IMAGE: (u32, u32) = (200, 100);
-const INFOBAR_IMAGE: (u32, u32) = (248, 58);
 
 /// A profile keeps one array per controller kind; which one a slot lives in is decided by its
 /// controller, exactly as the old frontend did it. Touchpoints share the keypad array, appended
@@ -487,7 +480,10 @@ impl RustyDeckShell {
                 match event {
                     FrontendEvent::Devices => refresh_catalogue(&this, cx).await,
                     // A page changed on the deck - follow it in the window.
-                    FrontendEvent::SwitchProfile => reload_profile(&this, cx).await,
+                    // The page swap repainted the deck on its way through `pages::show`, so this
+                    // only has to bring the window into line - pushing again would stop and
+                    // restart the animation players that push just started.
+                    FrontendEvent::SwitchProfile => reload_page(&this, cx, Repaint::IfStale).await,
                 }
             }
         })
@@ -913,12 +909,30 @@ impl RustyDeckShell {
 
     fn delete_custom_action(&mut self, id: String, cx: &mut Context<Self>) {
         self.row_menu_open = None;
+        // Read before the directory goes: slots reference the entry by its stable id, not by the
+        // slug the row is keyed on.
+        let custom_id = self.custom.iter().find(|action| action.slug == id).map(|action| action.id().to_owned());
         if let Err(error) = custom_actions::delete(&id) {
             log::error!("Failed to delete custom action: {error}");
             return;
         }
         self.custom.retain(|action| action.slug != id);
         cx.notify();
+
+        // The slots made from it have to go with it. A slot carries its own copy of the command and
+        // artwork, so deleting the entry alone leaves a face that draws black - its artwork went
+        // with the directory - while still running when pressed and still holding the slot against
+        // anything else being put there.
+        let Some(custom_id) = custom_id else { return };
+        cx.spawn(async move |this, cx| {
+            let touched = crate::bridge(crate::store::profiles::discard_custom_action(custom_id)).await;
+            crate::bridge(crate::animation::forget_frames()).await;
+            for device in touched {
+                crate::bridge(crate::device_render::repaint(device)).await;
+            }
+            reload_profile(&this, cx).await;
+        })
+        .detach();
     }
 
     /// Open the action form, either blank or prepopulated from an existing action.
@@ -1504,74 +1518,11 @@ impl RustyDeckShell {
 
 /// Composite and push every slot's image to the physical device.
 ///
-/// The backend never renders images itself (see `device_render`), so nothing reaches the hardware
-/// unless the shell does this - on load and after every mutation, mirroring how the old frontend
-/// re-rendered each slot's canvas whenever it re-rendered the grid.
-/// Composite every slot at the device's own resolution and push it to the hardware.
-///
-/// Runs on the Tokio runtime rather than being awaited on the window's executor: this decodes,
-/// composites and JPEG-encodes once per slot, which on a profile full of artwork is long enough to
-/// stall the window - it was why the palette took a moment to catch up after saving an action.
+/// Runs on the Tokio runtime rather than being awaited on the window's executor: compositing a
+/// profile full of artwork is long enough to stall the window - it was why the palette took a
+/// moment to catch up after saving an action.
 fn push_device_images(device: DeviceInfo, profile: Profile) {
-    crate::spawn(push_device_images_now(device, profile));
-}
-
-async fn push_device_images_now(device: DeviceInfo, profile: Profile) {
-    let _timed = crate::shared::Timed::start("push_device_images (all slots)");
-    // Stopped before the stills go out, restarted after. A player left running would race this,
-    // writing animation frames into slots that are being reset to their resting image.
-    crate::animation::stop(&device.id).await;
-    // Touchpoints live in the keypad array, appended after the keys.
-    let keypad_count = (device.rows as usize) * (device.columns as usize) + device.touchpoints as usize;
-
-    let groups = [
-        (KEYPAD_CONTROLLER, keypad_count, KEY_IMAGE),
-        (ENCODER_CONTROLLER, device.encoders as usize, ENCODER_IMAGE),
-        (INFOBAR_CONTROLLER, device.infobars as usize, INFOBAR_IMAGE),
-    ];
-
-    for (controller, count, (width, height)) in groups {
-        let slots = slots(&profile, controller);
-
-        for (position, slot) in slots.iter().enumerate().take(count) {
-            let context = SlotContext {
-                device: device.id.clone(),
-                profile: profile.id.clone(),
-                controller: controller.to_owned(),
-                position: position as u8,
-            };
-
-            let image = match slot.as_ref() {
-                Some(instance) => match instance.states.get(instance.current_state as usize) {
-                    Some(state) => {
-                        // Compositing is CPU work, so it goes to a blocking worker rather than
-                        // holding a runtime thread.
-                        let state = state.clone();
-                        match tokio::task::spawn_blocking(move || render_state(&state, width, height)).await {
-                            Ok(Ok(image)) => Some(image),
-                            Ok(Err(error)) => {
-                                log::warn!("Failed to render image for {controller} slot {position}: {error}");
-                                continue;
-                            }
-                            Err(error) => {
-                                log::warn!("Rendering panicked for {controller} slot {position}: {error}");
-                                continue;
-                            }
-                        }
-                    }
-                    None => None,
-                },
-                // `None` clears the slot on the device.
-                None => None,
-            };
-
-            frontend::instances::update_image(context, image).await;
-        }
-    }
-
-    // Only the page on screen animates. A page you are not looking at would spend the same frame
-    // budget for nothing, and the deck shows one page at a time.
-    crate::animation::start(device, profile).await;
+    crate::spawn(crate::device_render::push_profile(device, profile));
 }
 
 /// Re-read the selected profile from the backend and push it to the hardware.
@@ -1603,8 +1554,22 @@ async fn reload_dials(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp
     });
 }
 
+/// Whether re-reading the page also has to repaint the deck.
+enum Repaint {
+    /// The window changed something the hardware cannot know about, so it is told either way.
+    Always,
+    /// Something else has already painted this page - a page swap repaints from `pages::show`,
+    /// which is what a deck with no window open relies on. Only push if the sync below moved the
+    /// page out from under that.
+    IfStale,
+}
+
 async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
-    let _timed = crate::shared::Timed::start("reload_profile");
+    reload_page(this, cx, Repaint::Always).await;
+}
+
+async fn reload_page(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp, repaint: Repaint) {
+    let _timed = crate::shared::Timed::start("reload_page");
     let Some(device) = this.update(cx, |this, _| this.device.clone()).ok().flatten() else {
         return;
     };
@@ -1616,7 +1581,8 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
     // action was edited since. Only the visible page needs this: the deck shows one page at a
     // time, and every page switch comes back through here. Re-read afterwards, or the copy in
     // hand - and so the window and the images pushed to the deck - would still be the stale one.
-    let profile = if sync_custom_instances(&device, &profile).await {
+    let stale = sync_custom_instances(&device, &profile).await;
+    let profile = if stale {
         match crate::bridge(frontend::profiles::get_selected_profile(device.id.clone())).await {
             Ok(refreshed) => refreshed,
             Err(_) => profile,
@@ -1637,7 +1603,9 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
         cx.notify();
     });
 
-    push_device_images(device, profile);
+    if stale || matches!(repaint, Repaint::Always) {
+        push_device_images(device, profile);
+    }
 }
 
 /// Re-apply the current definition of any custom action that a slot was created from.
@@ -2229,22 +2197,34 @@ impl RustyDeckShell {
                     .child(
                         Button::new("restore-backup")
                             .icon(IconName::ArrowUp)
+                            .tooltip("Restore from a backup")
                             .on_click(cx.listener(|this, _event, window, cx| this.choose_backup(window, cx))),
                     )
                     .child(
                         Button::new("export-backup")
                             .icon(IconName::ArrowDown)
+                            .tooltip("Export a backup")
                             .on_click(cx.listener(|this, _event, window, cx| this.export_backup(window, cx))),
                     )
                     .child(
                         div().relative().child(
                             Button::new("swap-device")
                                 .icon(IconName::Replace)
+                                .tooltip("Switch device")
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     this.device_picker_open = !this.device_picker_open;
                                     cx.notify();
                                 })),
                         ),
+                    )
+                    // The same thing the compositor's own close does: the window goes away and the
+                    // deck carries on being served from the tray. Under Hyprland there is no
+                    // titlebar to close from, so without this there is no close control at all.
+                    .child(
+                        Button::new("close-window")
+                            .icon(IconName::Close)
+                            .tooltip("Close window")
+                            .on_click(|_event, _window, _cx| crate::dismiss_window()),
                     ),
             )
             .children(picker)

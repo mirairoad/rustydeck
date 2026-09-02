@@ -530,6 +530,59 @@ pub async fn get_instance_mut<'a>(context: &crate::shared::ActionContext, locks:
 	Ok(None)
 }
 
+/// Clear every slot, on every page of every device, that `discard` says to drop.
+///
+/// Returns the devices whose pages changed, so the caller can repaint them.
+///
+/// A slot is a self-contained copy of what it does: the command and the artwork are written onto
+/// the instance so the deck works without consulting the library it came from (see
+/// `sync_custom_instances`). That is also why a slot outlives the library entry it was made from -
+/// nothing about it stops working - and why clearing one has to be deliberate.
+pub async fn discard_instances(discard: impl Fn(&ActionInstance) -> bool) -> Vec<String> {
+	// Cloned up front: `DEVICES` is a live map, and the loop below holds the store locks across
+	// awaits while it saves.
+	let devices: Vec<DeviceInfo> = DEVICES.iter().map(|entry| entry.value().clone()).collect();
+	let mut locks = acquire_locks_mut().await;
+	let mut touched = Vec::new();
+
+	for device in devices {
+		let mut device_changed = false;
+		// Every page, not just the one showing: a slot on a page nobody is looking at is exactly
+		// the one that goes unnoticed.
+		for page in get_device_profiles(&device.id).unwrap_or_default() {
+			let Ok(store) = locks.profile_stores.get_profile_store_mut(&device, &page).await else {
+				continue;
+			};
+
+			let mut page_changed = false;
+			for slot in store.value.keys.iter_mut().chain(store.value.sliders.iter_mut()).chain(store.value.infobars.iter_mut()) {
+				if slot.as_ref().is_some_and(&discard) {
+					*slot = None;
+					page_changed = true;
+				}
+			}
+
+			if page_changed {
+				if let Err(error) = store.save() {
+					log::error!("Failed to save page {page} of {} after clearing slots: {error}", device.id);
+				}
+				device_changed = true;
+			}
+		}
+
+		if device_changed {
+			touched.push(device.id);
+		}
+	}
+
+	touched
+}
+
+/// Clear every slot made from a custom action, for when that action leaves the library.
+pub async fn discard_custom_action(custom_id: String) -> Vec<String> {
+	discard_instances(|instance| instance.settings.get("rustydeck_custom").and_then(|value| value.as_str()) == Some(custom_id.as_str())).await
+}
+
 pub async fn mark_profile_stale(device_id: &str, locks: &mut LocksMut<'_>) -> Result<(), anyhow::Error> {
 	let selected_profile = locks.device_stores.get_selected_profile(device_id)?;
 	let device = DEVICES.get(device_id).ok_or_else(|| anyhow!("device not found"))?;

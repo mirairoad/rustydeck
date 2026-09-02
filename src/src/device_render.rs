@@ -3,10 +3,10 @@
 //! The old Svelte frontend did this in an HTML `<canvas>` (`src/lib/rendererHelper.ts`) and handed
 //! the finished bitmap to the backend as a JPEG data URI. The backend never composites anything
 //! itself - `elgato::update_image` only base64-decodes what it is given and writes it to the
-//! device - so this job belongs to the shell, and this module is a faithful port of that canvas
+//! device - so this job belongs here, and the drawing below is a faithful port of that canvas
 //! drawing logic (same 144px canvas, same scale/offset/baseline maths).
 
-use crate::shared::{ActionState, config_dir};
+use crate::shared::{ActionState, DeviceInfo, Profile, config_dir};
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -21,6 +21,13 @@ use image::{DynamicImage, Rgba, RgbaImage, imageops::FilterType};
 /// The canvas size the old frontend rendered at. `elgato-streamdeck` downscales to whatever the
 /// specific model needs (72/80/96px depending on Kind), so this one size covers every Stream Deck.
 pub const CANVAS: u32 = 144;
+
+/// Sizes of the physical displays each controller writes to. Keys are square, but the touch strip
+/// is one wide LCD written a 200x100 region at a time (one per dial), and the Neo's infobar is a
+/// letterbox - so each kind has to be composited at its own aspect, not scaled from a square.
+pub const KEY_IMAGE: (u32, u32) = (144, 144);
+pub const ENCODER_IMAGE: (u32, u32) = (200, 100);
+pub const INFOBAR_IMAGE: (u32, u32) = (248, 58);
 
 /// Action state images are stored either as an absolute path (user-uploaded custom images, under
 /// `config_dir/images/...`) or as a path relative to `config_dir` (plugin-bundled icons, already
@@ -271,4 +278,112 @@ fn encode_jpeg(canvas: RgbaImage) -> Result<String> {
 	let mut buffer = Vec::new();
 	DynamicImage::ImageRgb8(flattened).write_to(&mut Cursor::new(&mut buffer), image::ImageFormat::Jpeg)?;
 	Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(&buffer)))
+}
+
+// ---------------------------------------------------------------------------
+// Getting a whole page onto the hardware
+// ---------------------------------------------------------------------------
+
+/// A profile keeps one array per controller kind; which one a slot lives in is decided by its
+/// controller. Touchpoints share the keypad array, appended after the keys.
+fn slots<'a>(profile: &'a Profile, controller: &str) -> &'a Vec<Option<crate::shared::ActionInstance>> {
+	match controller {
+		"Encoder" => &profile.sliders,
+		"Infobar" => &profile.infobars,
+		_ => &profile.keys,
+	}
+}
+
+/// One whole-page push at a time per device.
+///
+/// A push is a second of stills going out over that device's wire while its animation player is
+/// stopped either side. Two overlapping pushes interleaved those writes - one laying down stills
+/// while the other had already restarted the player - and the deck showed the fight. Per device
+/// rather than global, because the time is spent on one device's wire and another deck's page
+/// change has no reason to wait behind it.
+static PUSHES: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+
+async fn push_lock(device_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+	PUSHES.lock().await.entry(device_id.to_owned()).or_default().clone()
+}
+
+/// Composite every slot of `profile` at the device's own resolution and push it to the hardware.
+///
+/// Nothing else paints a deck: the device layer only base64-decodes what it is handed, so a face
+/// nobody pushes to keeps whatever the driver last left there. On load, after every mutation, and
+/// when hardware appears - mirroring how the old frontend re-rendered each slot's canvas whenever
+/// it re-rendered the grid.
+pub async fn push_profile(device: DeviceInfo, profile: Profile) {
+	let _timed = crate::shared::Timed::start("push_profile (all slots)");
+	// Queued behind any push already going out to this deck, rather than interleaved with it.
+	let serialised = push_lock(&device.id).await;
+	let _push = serialised.lock().await;
+	// Stopped before the stills go out, restarted after. A player left running would race this,
+	// writing animation frames into slots that are being reset to their resting image.
+	crate::animation::stop(&device.id).await;
+	// Touchpoints live in the keypad array, appended after the keys.
+	let keypad_count = (device.rows as usize) * (device.columns as usize) + device.touchpoints as usize;
+
+	let groups = [
+		("Keypad", keypad_count, KEY_IMAGE),
+		("Encoder", device.encoders as usize, ENCODER_IMAGE),
+		("Infobar", device.infobars as usize, INFOBAR_IMAGE),
+	];
+
+	for (controller, count, (width, height)) in groups {
+		for (position, slot) in slots(&profile, controller).iter().enumerate().take(count) {
+			let context = crate::shared::Context {
+				device: device.id.clone(),
+				profile: profile.id.clone(),
+				controller: controller.to_owned(),
+				position: position as u8,
+			};
+
+			let image = match slot.as_ref() {
+				Some(instance) => match instance.states.get(instance.current_state as usize) {
+					Some(state) => {
+						// Compositing is CPU work, so it goes to a blocking worker rather than
+						// holding a runtime thread.
+						let state = state.clone();
+						match tokio::task::spawn_blocking(move || render_state(&state, width, height)).await {
+							Ok(Ok(image)) => Some(image),
+							Ok(Err(error)) => {
+								log::warn!("Failed to render image for {controller} slot {position}: {error}");
+								continue;
+							}
+							Err(error) => {
+								log::warn!("Rendering panicked for {controller} slot {position}: {error}");
+								continue;
+							}
+						}
+					}
+					None => None,
+				},
+				// `None` clears the slot on the device.
+				None => None,
+			};
+
+			crate::events::frontend::instances::update_image(context, image).await;
+		}
+	}
+
+	// Only the page on screen animates. A page you are not looking at would spend the same frame
+	// budget for nothing, and the deck shows one page at a time.
+	crate::animation::start(device, profile).await;
+}
+
+/// Paint a device from the page it currently has selected.
+///
+/// What a deck shows belongs to the deck and the page it is on, not to whichever device the window
+/// happens to have open, so this reads the selection itself rather than being handed a profile.
+/// That is what a deck coming back needs: it is the same hardware on the same page, and the window
+/// - already showing it - has no reason to think anything changed.
+pub async fn repaint(device_id: String) {
+	let Some(device) = crate::shared::DEVICES.get(&device_id).map(|entry| entry.value().clone()) else {
+		return;
+	};
+	match crate::events::frontend::profiles::get_selected_profile(device_id.clone()).await {
+		Ok(profile) => push_profile(device, profile).await,
+		Err(error) => log::warn!("Failed to read the selected page for {device_id}: {error}"),
+	}
 }

@@ -128,6 +128,21 @@ failure leaves the existing setup untouched. An archive that is not a RustyDeck
 backup, or that contains a path climbing out of the directory, is refused before
 anything moves.
 
+## The tray
+
+RustyDeck lives in the tray, and closing the window - with the X in the header,
+the compositor's own close, or **Hide** - leaves the process running and the deck
+being served. **Show** brings the window back; whichever of the two does not
+apply is greyed out.
+
+**Run at login: on/off** writes a desktop entry to
+`~/.config/autostart/rustydeck.desktop` pointing at the copy of RustyDeck that
+turned the setting on, and starts it with `--hidden` so a login does not put a
+window in front of you. Every desktop reads that directory, either itself or
+through systemd's xdg-autostart generator. The state is the file, and the label
+follows it - remove the entry by hand and the menu says `off` again. It says so
+in words rather than showing a checkmark because not every tray draws one.
+
 ## The simulator
 
 Debug builds register a simulated deck for every model - Mini, Stream Deck,
