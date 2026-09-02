@@ -26,6 +26,11 @@ pub async fn register_device(mut event: PayloadEvent<crate::shared::DeviceInfo>)
 	let _ = crate::device_sleep::apply_initial_device_sleep(&event.payload.id).await;
 	crate::events::frontend::update_devices().await;
 
+	// Before anything is drawn, and before the locks below are taken: a slot whose custom action
+	// was deleted draws as a blank face but still runs, so it is worth clearing while every page
+	// of this device is being read anyway.
+	crate::custom_actions::discard_orphaned_instances().await;
+
 	let mut locks = crate::store::profiles::acquire_locks_mut().await;
 	let selected_profile = locks.device_stores.get_selected_profile(&event.payload.id)?;
 

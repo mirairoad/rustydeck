@@ -383,6 +383,50 @@ pub fn load_predefined() -> Vec<CustomAction> {
 	load_from(predefined_dir())
 }
 
+/// Clear the slots left behind by library entries that no longer exist.
+///
+/// Deleting an entry used to leave its slots where they were. A slot keeps its own copy of the
+/// command and the artwork - that is what lets the deck run without consulting the library - so
+/// what was left was a face that draws black, because the artwork went with the directory, yet
+/// still runs when it is pressed and still holds the slot against anything else being put there.
+/// [`crate::store::profiles::discard_custom_action`] handles this at the point of deletion now;
+/// this is for the ones stranded before it did.
+///
+/// Both halves have to be gone - the entry and the artwork it pointed at - before a slot is
+/// cleared. A library that failed to read would otherwise take every custom slot on the deck with
+/// it, and in that case the artwork is still there on disk.
+pub async fn discard_orphaned_instances() {
+	let mut known: Vec<String> = load().into_iter().map(|action| action.config.id).collect();
+	known.extend(load_predefined().into_iter().map(|action| action.config.id));
+
+	let touched = crate::store::profiles::discard_instances(|instance| {
+		let Some(id) = instance.settings.get("rustydeck_custom").and_then(|value| value.as_str()) else {
+			return false;
+		};
+		if known.iter().any(|entry| entry == id) {
+			return false;
+		}
+		let stranded = instance
+			.states
+			.first()
+			.is_none_or(|state| !crate::device_render::resolve_image_path(&state.image).exists());
+		if stranded {
+			log::info!(
+				"Clearing {} slot {} on page {}: the custom action it was made from is gone",
+				instance.context.controller,
+				instance.context.position,
+				instance.context.profile
+			);
+		}
+		stranded
+	})
+	.await;
+
+	for device in touched {
+		crate::device_render::repaint(device).await;
+	}
+}
+
 /// Compose the strip face for an action that predates it.
 ///
 /// Recomposed from the stored source rather than scaled from the square picture, which already has

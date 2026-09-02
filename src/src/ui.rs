@@ -909,12 +909,30 @@ impl RustyDeckShell {
 
     fn delete_custom_action(&mut self, id: String, cx: &mut Context<Self>) {
         self.row_menu_open = None;
+        // Read before the directory goes: slots reference the entry by its stable id, not by the
+        // slug the row is keyed on.
+        let custom_id = self.custom.iter().find(|action| action.slug == id).map(|action| action.id().to_owned());
         if let Err(error) = custom_actions::delete(&id) {
             log::error!("Failed to delete custom action: {error}");
             return;
         }
         self.custom.retain(|action| action.slug != id);
         cx.notify();
+
+        // The slots made from it have to go with it. A slot carries its own copy of the command and
+        // artwork, so deleting the entry alone leaves a face that draws black - its artwork went
+        // with the directory - while still running when pressed and still holding the slot against
+        // anything else being put there.
+        let Some(custom_id) = custom_id else { return };
+        cx.spawn(async move |this, cx| {
+            let touched = crate::bridge(crate::store::profiles::discard_custom_action(custom_id)).await;
+            crate::bridge(crate::animation::forget_frames()).await;
+            for device in touched {
+                crate::bridge(crate::device_render::repaint(device)).await;
+            }
+            reload_profile(&this, cx).await;
+        })
+        .detach();
     }
 
     /// Open the action form, either blank or prepopulated from an existing action.
