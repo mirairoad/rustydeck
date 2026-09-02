@@ -198,11 +198,8 @@ impl Animation {
 // Playback
 // ---------------------------------------------------------------------------
 
+use crate::device_render::{ENCODER_IMAGE, KEY_IMAGE};
 use crate::shared::{Context as SlotContext, DeviceInfo, Profile};
-
-/// The pixel sizes the renderer composites each surface at, matching `ui`'s own constants.
-const KEY_IMAGE: (u32, u32) = (144, 144);
-const ENCODER_IMAGE: (u32, u32) = (200, 100);
 
 use std::collections::HashMap;
 use std::sync::LazyLock;

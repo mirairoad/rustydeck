@@ -65,6 +65,10 @@ pub async fn deregister_device(event: PayloadEvent<String>) -> Result<(), anyhow
 	drop(locks);
 
 	DEVICES.remove(&event.payload);
+	// Nothing to animate on hardware that has gone. Left running, the player keeps compositing
+	// frames for a deck that cannot take them - and lands them on the faces of the next deck to
+	// come back under the same id, over stills that have not been pushed yet.
+	crate::animation::stop(&event.payload).await;
 	crate::device_sleep::deregister_device(&event.payload);
 	crate::events::frontend::update_devices().await;
 

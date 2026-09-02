@@ -190,6 +190,11 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 	.await
 	.unwrap();
 
+	// Every face was blanked above, and a deck is only ever painted by something pushing a page to
+	// it. Without this, a deck unplugged and plugged back in comes up dark and stays dark: the
+	// window is already showing it, so nothing up there thinks anything has changed.
+	crate::spawn(crate::device_render::repaint(device_id.clone()));
+
 	let press = |position| inbound::PayloadEvent {
 		payload: inbound::devices::PressPayload { device: device_id.clone(), position },
 	};

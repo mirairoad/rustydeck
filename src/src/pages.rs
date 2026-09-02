@@ -59,6 +59,11 @@ pub async fn step(device: &str, delta: i32) -> Result<()> {
 /// Switch to a page by name, creating it if it does not exist yet.
 pub async fn show(device: &str, page: &str) -> Result<()> {
 	profiles::set_selected_profile(device.to_owned(), page.to_owned()).await?;
+	// The swap clears the deck, and a page's stills only reach the hardware when something pushes
+	// them. That has to happen here rather than in whatever asked for the page: a deck served from
+	// the tray has no window to do it, and a page arrow on the deck itself is the commonest way to
+	// change page. The event below still goes out, so an open window follows along as before.
+	crate::spawn(crate::device_render::repaint(device.to_owned()));
 	crate::frontend_events::emit(crate::frontend_events::FrontendEvent::SwitchProfile);
 	Ok(())
 }
