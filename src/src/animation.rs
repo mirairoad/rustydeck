@@ -304,7 +304,16 @@ pub async fn stop(device_id: &str) {
 /// One task for the whole device rather than one per slot: the driver batches image writes and
 /// sends them on `flush`, so a timer per slot would flush per slot and throw that batching away.
 pub async fn start(device: DeviceInfo, profile: Profile) {
-	stop(&device.id).await;
+	// Held from before the running player is dropped until the new one is in the map, so two
+	// pushes racing for the same deck cannot each leave a player behind. Taking the lock twice -
+	// once to stop, once to insert - let the second caller's handle be overwritten rather than
+	// aborted, and the orphaned task went on writing frames over the tracked one: a key vibrating
+	// at twice the rate, with nothing left holding a handle to stop it. `stop` is not called here
+	// for that reason - it takes the same lock, which is not reentrant.
+	let mut players = PLAYERS.lock().await;
+	if let Some(handle) = players.remove(&device.id) {
+		handle.abort();
+	}
 
 	let slots = collect_slots(&device, &profile);
 	if slots.is_empty() {
@@ -335,7 +344,7 @@ pub async fn start(device: DeviceInfo, profile: Profile) {
 	let handle = crate::spawn(async move {
 		run(slots, fps).await;
 	});
-	PLAYERS.lock().await.insert(device_id, handle);
+	players.insert(device_id, handle);
 }
 
 /// Play a slot's effect once, from the still and back to it.

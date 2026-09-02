@@ -294,6 +294,19 @@ fn slots<'a>(profile: &'a Profile, controller: &str) -> &'a Vec<Option<crate::sh
 	}
 }
 
+/// One whole-page push at a time per device.
+///
+/// A push is a second of stills going out over that device's wire while its animation player is
+/// stopped either side. Two overlapping pushes interleaved those writes - one laying down stills
+/// while the other had already restarted the player - and the deck showed the fight. Per device
+/// rather than global, because the time is spent on one device's wire and another deck's page
+/// change has no reason to wait behind it.
+static PUSHES: LazyLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
+
+async fn push_lock(device_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+	PUSHES.lock().await.entry(device_id.to_owned()).or_default().clone()
+}
+
 /// Composite every slot of `profile` at the device's own resolution and push it to the hardware.
 ///
 /// Nothing else paints a deck: the device layer only base64-decodes what it is handed, so a face
@@ -302,6 +315,9 @@ fn slots<'a>(profile: &'a Profile, controller: &str) -> &'a Vec<Option<crate::sh
 /// it re-rendered the grid.
 pub async fn push_profile(device: DeviceInfo, profile: Profile) {
 	let _timed = crate::shared::Timed::start("push_profile (all slots)");
+	// Queued behind any push already going out to this deck, rather than interleaved with it.
+	let serialised = push_lock(&device.id).await;
+	let _push = serialised.lock().await;
 	// Stopped before the stills go out, restarted after. A player left running would race this,
 	// writing animation frames into slots that are being reset to their resting image.
 	crate::animation::stop(&device.id).await;

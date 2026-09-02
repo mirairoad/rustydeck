@@ -480,7 +480,10 @@ impl RustyDeckShell {
                 match event {
                     FrontendEvent::Devices => refresh_catalogue(&this, cx).await,
                     // A page changed on the deck - follow it in the window.
-                    FrontendEvent::SwitchProfile => reload_profile(&this, cx).await,
+                    // The page swap repainted the deck on its way through `pages::show`, so this
+                    // only has to bring the window into line - pushing again would stop and
+                    // restart the animation players that push just started.
+                    FrontendEvent::SwitchProfile => reload_page(&this, cx, Repaint::IfStale).await,
                 }
             }
         })
@@ -1533,8 +1536,22 @@ async fn reload_dials(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp
     });
 }
 
+/// Whether re-reading the page also has to repaint the deck.
+enum Repaint {
+    /// The window changed something the hardware cannot know about, so it is told either way.
+    Always,
+    /// Something else has already painted this page - a page swap repaints from `pages::show`,
+    /// which is what a deck with no window open relies on. Only push if the sync below moved the
+    /// page out from under that.
+    IfStale,
+}
+
 async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp) {
-    let _timed = crate::shared::Timed::start("reload_profile");
+    reload_page(this, cx, Repaint::Always).await;
+}
+
+async fn reload_page(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncApp, repaint: Repaint) {
+    let _timed = crate::shared::Timed::start("reload_page");
     let Some(device) = this.update(cx, |this, _| this.device.clone()).ok().flatten() else {
         return;
     };
@@ -1546,7 +1563,8 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
     // action was edited since. Only the visible page needs this: the deck shows one page at a
     // time, and every page switch comes back through here. Re-read afterwards, or the copy in
     // hand - and so the window and the images pushed to the deck - would still be the stale one.
-    let profile = if sync_custom_instances(&device, &profile).await {
+    let stale = sync_custom_instances(&device, &profile).await;
+    let profile = if stale {
         match crate::bridge(frontend::profiles::get_selected_profile(device.id.clone())).await {
             Ok(refreshed) => refreshed,
             Err(_) => profile,
@@ -1567,7 +1585,9 @@ async fn reload_profile(this: &WeakEntity<RustyDeckShell>, cx: &mut gpui::AsyncA
         cx.notify();
     });
 
-    push_device_images(device, profile);
+    if stale || matches!(repaint, Repaint::Always) {
+        push_device_images(device, profile);
+    }
 }
 
 /// Re-apply the current definition of any custom action that a slot was created from.
